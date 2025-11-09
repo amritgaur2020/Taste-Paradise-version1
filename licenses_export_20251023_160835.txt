@@ -1,0 +1,125 @@
+======================================================================
+TASTEPARADISE LICENSE LIST
+Exported: 2025-10-23 16:08:35
+MODE: Offline (Backup Data)
+======================================================================
+
+License Key: 864BD-0C066-07777-3017D-588C6
+Customer: Amrit Gaur
+Plan: enterprise
+Expires: 2035-10-13
+Status: Active
+----------------------------------------------------------------------
+
+License Key: 6F151-17AE7-C844A-DB2EA-DFC0E
+Customer: Amrit69
+Plan: basic
+Expires: 2025-10-16
+Status: Active
+----------------------------------------------------------------------
+
+License Key: 158BC-6A7CC-1818F-74E1E-449F8
+Customer: Raju
+Plan: basic
+Expires: 2026-10-15
+Status: Active
+----------------------------------------------------------------------
+
+License Key: 8C07F-335EC-064AB-92504-B5A44
+Customer: qw
+Plan: basic
+Expires: 2026-10-15
+Status: Active
+----------------------------------------------------------------------
+
+License Key: A9843-D0FA5-5DA08-4B058-95B49
+Customer: mm
+Plan: basic
+Expires: 2026-10-15
+Status: REVOKED
+----------------------------------------------------------------------
+
+License Key: 3D9A9-CD988-E1DE9-B5FBD-B13A8
+Customer: Taj
+Plan: pro
+Expires: 2026-10-15
+Status: REVOKED
+----------------------------------------------------------------------
+
+License Key: 177A1-F8DE3-D22A5-096AD-4B7D7
+Customer: taste
+Plan: enterprise
+Expires: 2035-10-13
+Status: REVOKED
+----------------------------------------------------------------------
+
+License Key: 8EB13-CCF9E-82175-262BF-B6253
+Customer: Taj
+Plan: basic
+Expires: 2026-10-15
+Status: REVOKED
+----------------------------------------------------------------------
+
+License Key: A8152-7A1E8-9510F-1A0B7-BA9F3
+Customer: HIES
+Plan: pro
+Expires: 2026-10-15
+Status: REVOKED
+----------------------------------------------------------------------
+
+License Key: BEB04-C2DC9-029FE-1E795-4D526
+Customer: kk hotel
+Plan: basic
+Expires: 2025-10-16
+Status: REVOKED
+----------------------------------------------------------------------
+
+License Key: 6DF2E-CAE29-BF219-E5A55-C3758
+Customer: ll hotel
+Plan: basic
+Expires: 2026-10-15
+Status: REVOKED
+----------------------------------------------------------------------
+
+License Key: F0BAA-3EDD2-AC1E8-BB4F0-9009A
+Customer: qq hotel
+Plan: basic
+Expires: 2026-10-15
+Status: REVOKED
+----------------------------------------------------------------------
+
+License Key: 05FA6-6FE6C-B2974-C9497-EE817
+Customer: ii hotel
+Plan: basic
+Expires: 2026-10-15
+Status: Active
+----------------------------------------------------------------------
+
+License Key: F1491-E04EE-A8E72-39B44-FD263
+Customer: wwhotel
+Plan: basic
+Expires: 2026-10-15
+Status: Active
+----------------------------------------------------------------------
+
+License Key: A5C20-5EDB8-C99DB-9D81F-17158
+Customer: PPHotel
+Plan: pro
+Expires: 2026-10-15
+Status: Active
+----------------------------------------------------------------------
+
+License Key: C5172-3B215-E69AE-D9D5E-8BB92
+Customer: oohotel
+Plan: enterprise
+Expires: 2035-10-13
+Status: Active
+----------------------------------------------------------------------
+
+License Key: DE62C-D06C0-8C56C-9AF82-48253
+Customer: om
+Plan: enterprise
+Expires: 2035-10-13
+Status: Active
+----------------------------------------------------------------------
+

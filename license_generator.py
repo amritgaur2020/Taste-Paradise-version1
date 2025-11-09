@@ -1,341 +1,190 @@
 """
-TasteParadise License Generator
-USE THIS TO GENERATE LICENSE KEYS FOR CUSTOMERS
-Keep this file SECRET - don't give to customers!
-
-Author: Your Name
-Created: October 2025
+TasteParadise License Key Generator - OFFLINE
+Generate license keys and activation codes
+Author: Amrit Gaur
 """
 
+import secrets
+import string
 import hashlib
 import json
-import secrets
 from datetime import datetime, timedelta
-from pathlib import Path
 
-SECRET_KEY = "TasteParadise_Secret_2025_UTU_Project"  # Must match license_system.py!
+# ============================================================
+# IMPORTANT: Use the SAME secret key in both generator and validator
+# ============================================================
+SECRET_KEY = "TasteParadise_Secret_2025_Amrit_Gaur_XYZ123"
 
-class LicenseGenerator:
-    """Generate license keys for customers"""
+class OfflineLicenseGenerator:
+    """Generate license keys and activation codes"""
     
     def __init__(self):
         self.secret_key = SECRET_KEY
-        self.db_file = Path("licenses_db.json")
-        self._init_database()
+        self.chars = string.ascii_uppercase + string.digits
     
-    def _init_database(self):
-        """Create database file if it doesn't exist"""
-        if not self.db_file.exists():
-            with open(self.db_file, 'w') as f:
-                json.dump([], f)
+    def generate_license_key(self):
+        """Generate random license key: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX"""
+        segments = []
+        for _ in range(5):
+            segment = ''.join(secrets.choice(self.chars) for _ in range(5))
+            segments.append(segment)
+        return '-'.join(segments)
     
-    def generate_license(self, customer_name, email, phone="", plan="basic", duration_days=365):
+    def generate_activation_code(self, license_key, machine_id, expiry_days=365):
         """
-        Generate a new license key
-        
-        Args:
-            customer_name: Restaurant name (e.g., "Maharaja Restaurant")
-            email: Customer email
-            phone: Customer phone (optional)
-            plan: "basic", "pro", or "enterprise"
-            duration_days: Validity period (365 = 1 year, 730 = 2 years)
-        
-        Returns:
-            license_key: The generated key (format: XXXXX-XXXXX-XXXXX-XXXXX-XXXXX)
-            license_data: Full license information dictionary
+        Generate activation code that binds license key to machine ID
         """
-        # Create license data
-        license_data = {
-            'customer': customer_name,
-            'email': email,
-            'phone': phone,
-            'plan': plan,
-            'issued_date': datetime.now().isoformat(),
-            'expiry_date': (datetime.now() + timedelta(days=duration_days)).isoformat(),
-            'max_activations': 1,  # Can only use on 1 computer
-            'duration_days': duration_days
+        expiry_date = (datetime.now() + timedelta(days=expiry_days)).isoformat()
+        
+        # Combine data
+        data = f"{license_key}|{machine_id}|{expiry_date}"
+        
+        # Create signature using secret key
+        signature = hashlib.sha256(f"{data}|{self.secret_key}".encode()).hexdigest()
+        
+        # Create activation code
+        activation_code = f"{license_key}|{machine_id}|{expiry_date}|{signature}"
+        
+        return activation_code
+    
+    def create_license(self, customer_name, plan_type, validity_days, machine_id=None):
+        """Create complete license package"""
+        license_key = self.generate_license_key()
+        
+        license_info = {
+            'license_key': license_key,
+            'customer_name': customer_name,
+            'plan': plan_type,
+            'generated_date': datetime.now().isoformat(),
+            'expiry_days': validity_days,
+            'machine_id': machine_id,
+            'status': 'generated' if not machine_id else 'activated'
         }
         
-        # Generate unique license ID (16 characters)
-        license_id = secrets.token_hex(8).upper()
+        # If machine ID provided, generate activation code
+        if machine_id:
+            activation_code = self.generate_activation_code(license_key, machine_id, validity_days)
+            license_info['activation_code'] = activation_code
+            license_info['expiry_date'] = (datetime.now() + timedelta(days=validity_days)).isoformat()
         
-        # Create signature (12 characters)
-        signature = self._create_signature(license_data)
-        
-        # Combine: ID (16) + Signature (9) = 25 characters total
-        combined = (license_id + signature)[:25]
-        
-        # Format as XXXXX-XXXXX-XXXXX-XXXXX-XXXXX
-        license_key = '-'.join([combined[i:i+5] for i in range(0, 25, 5)])
-        
-        # Save to database
-        self._save_to_database(license_key, license_data)
-        
-        return license_key, license_data
-    
-    def _create_signature(self, data):
-        """Create cryptographic signature that can't be forged"""
-        data_string = json.dumps({
-            'customer': data['customer'],
-            'plan': data['plan'],
-        }, sort_keys=True)
-        
-        message = f"{data_string}:{self.secret_key}"
-        return hashlib.sha256(message.encode()).hexdigest()[:12].upper()
-    
-    def _save_to_database(self, key, data):
-        """Save license to database"""
-        # Load existing licenses
-        try:
-            with open(self.db_file, 'r') as f:
-                licenses = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            licenses = []
-        
-        # Add new license
-        record = {
-            'key': key,
-            **data,
-            'activated': False,
-            'machine_id': None,
-            'activation_date': None,
-            'generated_date': datetime.now().isoformat()
-        }
-        licenses.append(record)
-        
-        # Save back
-        with open(self.db_file, 'w') as f:
-            json.dump(licenses, f, indent=2)
-    
-    def list_licenses(self, filter_plan=None, filter_activated=None):
-        """
-        List all generated licenses with optional filters
-        
-        Args:
-            filter_plan: Filter by plan ("basic", "pro", "enterprise")
-            filter_activated: Filter by activation status (True/False)
-        """
-        try:
-            with open(self.db_file, 'r') as f:
-                licenses = json.load(f)
-            
-            # Apply filters
-            if filter_plan:
-                licenses = [l for l in licenses if l.get('plan') == filter_plan]
-            
-            if filter_activated is not None:
-                licenses = [l for l in licenses if l.get('activated') == filter_activated]
-            
-            return licenses
-        except (FileNotFoundError, json.JSONDecodeError):
-            return []
-    
-    def get_license_details(self, license_key):
-        """Get details of a specific license"""
-        licenses = self.list_licenses()
-        for lic in licenses:
-            if lic['key'] == license_key:
-                return lic
-        return None
-    
-    def revoke_license(self, license_key):
-        """Revoke/disable a license"""
-        try:
-            with open(self.db_file, 'r') as f:
-                licenses = json.load(f)
-            
-            found = False
-            for lic in licenses:
-                if lic['key'] == license_key:
-                    lic['revoked'] = True
-                    lic['revoked_date'] = datetime.now().isoformat()
-                    found = True
-                    break
-            
-            if found:
-                with open(self.db_file, 'w') as f:
-                    json.dump(licenses, f, indent=2)
-                return True
-            return False
-        except Exception as e:
-            print(f"Error revoking license: {e}")
-            return False
+        return license_info
 
 
-def print_header():
-    """Print application header"""
+# ============================================================
+# ADMIN PANEL
+# ============================================================
+
+if __name__ == "__main__":
     print("\n" + "="*70)
-    print(" "*15 + "TASTEPARADISE LICENSE GENERATOR")
-    print(" "*20 + "For Internal Use Only")
+    print("  🔐 TASTEPARADISE OFFLINE LICENSE GENERATOR")
     print("="*70)
-
-
-def main():
-    """Interactive license generation"""
-    generator = LicenseGenerator()
+    
+    generator = OfflineLicenseGenerator()
     
     while True:
-        print_header()
-        print("\n📋 MENU:")
-        print("  1. Generate New License")
-        print("  2. View All Licenses")
-        print("  3. View License Details")
-        print("  4. Revoke License")
-        print("  5. View Statistics")
-        print("  6. Exit")
+        print("\n" + "="*70)
+        print("MENU:")
+        print("  1. Generate New License Key (send to customer)")
+        print("  2. Generate Activation Code (after customer sends Machine ID)")
+        print("  3. Exit")
+        print("="*70)
         
-        choice = input("\n👉 Select option (1-6): ").strip()
+        choice = input("\nSelect (1-3): ").strip()
         
-        if choice == "1":
-            # Generate New License
+        if choice == '1':
             print("\n" + "-"*70)
-            print("GENERATE NEW LICENSE")
+            print("GENERATE LICENSE KEY")
             print("-"*70)
             
-            customer = input("Restaurant Name: ").strip()
-            if not customer:
-                print("❌ Customer name is required!")
+            customer = input("Customer Name: ").strip()
+            
+            print("\nPlan Types:")
+            print("  1. TRIAL (7 days)")
+            print("  2. BASIC (1 year)")
+            print("  3. PRO (1 year)")
+            print("  4. ENTERPRISE (10 years)")
+            
+            plan_choice = input("\nSelect Plan (1-4): ").strip()
+            
+            plan_map = {
+                '1': ('trial', 7),
+                '2': ('basic', 365),
+                '3': ('pro', 365),
+                '4': ('enterprise', 3650)
+            }
+            
+            if plan_choice in plan_map:
+                plan_type, days = plan_map[plan_choice]
+                
+                license = generator.create_license(customer, plan_type, days)
+                
+                print("\n" + "="*70)
+                print("✅ LICENSE KEY GENERATED!")
+                print("="*70)
+                print(f"\n🔑 LICENSE KEY: {license['license_key']}")
+                print(f"👤 Customer: {customer}")
+                print(f"📦 Plan: {plan_type.upper()}")
+                print(f"⏱️ Validity: {days} days")
+                print("\n📧 SEND THIS TO CUSTOMER:")
+                print("-"*70)
+                print(f"License Key: {license['license_key']}")
+                print("\nNext Steps:")
+                print("1. Customer enters this license key in TasteParadise")
+                print("2. Software will show their Machine ID")
+                print("3. Customer sends you their Machine ID")
+                print("4. You generate Activation Code (Menu Option 2)")
+                print("="*70)
+                
+                # Save to file
+                filename = f"license_{license['license_key'][:15]}.json"
+                with open(filename, 'w') as f:
+                    json.dump(license, f, indent=2)
+                print(f"\n💾 Saved to: {filename}")
+            else:
+                print("❌ Invalid choice!")
+        
+        elif choice == '2':
+            print("\n" + "-"*70)
+            print("GENERATE ACTIVATION CODE")
+            print("-"*70)
+            
+            license_key = input("License Key: ").strip()
+            machine_id = input("Machine ID (from customer): ").strip()
+            
+            if len(license_key) != 29:
+                print("❌ Invalid license key format! Should be XXXXX-XXXXX-XXXXX-XXXXX-XXXXX")
                 continue
             
-            email = input("Customer Email: ").strip()
-            phone = input("Customer Phone (optional): ").strip()
+            if len(machine_id) != 16:
+                print("❌ Invalid machine ID format! Should be 16 characters.")
+                continue
             
-            print("\n📦 PLANS:")
-            print("  1. Basic   - ₹10,000 (1 year)")
-            print("  2. Pro     - ₹45,000 (1 year)")
-            print("  3. Enterprise - ₹99,000 (lifetime/10 years)")
+            days_input = input("Validity (days, default 365): ").strip()
+            days = int(days_input) if days_input else 365
             
-            plan_choice = input("\nSelect plan (1/2/3): ").strip()
-            plan_map = {"1": "basic", "2": "pro", "3": "enterprise"}
-            plan = plan_map.get(plan_choice, "basic")
-            
-            # Set duration
-            if plan == "enterprise":
-                duration = 3650  # 10 years
-            else:
-                duration_input = input("Duration in days (default 365 for 1 year): ").strip()
-                duration = int(duration_input) if duration_input.isdigit() else 365
-            
-            # Generate
-            print("\n⏳ Generating license...")
-            key, data = generator.generate_license(customer, email, phone, plan, duration)
+            activation_code = generator.generate_activation_code(license_key, machine_id, days)
             
             print("\n" + "="*70)
-            print("✅ LICENSE GENERATED SUCCESSFULLY!")
+            print("✅ ACTIVATION CODE GENERATED!")
             print("="*70)
-            print(f"🏪 Customer: {data['customer']}")
-            print(f"📧 Email: {data['email']}")
-            if data['phone']:
-                print(f"📱 Phone: {data['phone']}")
-            print(f"📦 Plan: {data['plan'].upper()}")
-            print(f"📅 Valid Until: {data['expiry_date'][:10]}")
-            print(f"\n🔑 LICENSE KEY:")
-            print(f"   {key}")
-            print("\n📧 Send this key to customer via email/WhatsApp")
-            print("="*70)
-            input("\nPress Enter to continue...")
-        
-        elif choice == "2":
-            # View All Licenses
-            licenses = generator.list_licenses()
-            
-            print("\n" + "="*70)
-            print(f"ALL LICENSES (Total: {len(licenses)})")
+            print(f"\n🔓 ACTIVATION CODE:")
+            print(f"{activation_code}")
+            print("\n📧 SEND THIS TO CUSTOMER:")
+            print("-"*70)
+            print("Your TasteParadise activation code:")
+            print(f"{activation_code}")
+            print("\nInstructions:")
+            print("1. Open TasteParadise")
+            print("2. Enter this activation code when prompted")
+            print("3. Your software will be activated!")
             print("="*70)
             
-            if not licenses:
-                print("\n⚠️  No licenses generated yet.")
-            else:
-                for i, lic in enumerate(licenses, 1):
-                    status = "✅ Activated" if lic.get('activated') else "⏳ Not Activated"
-                    revoked = " (🚫 REVOKED)" if lic.get('revoked') else ""
-                    
-                    print(f"\n{i}. {lic['customer']}")
-                    print(f"   Key: {lic['key']}")
-                    print(f"   Plan: {lic['plan'].upper()} | Status: {status}{revoked}")
-                    print(f"   Expires: {lic['expiry_date'][:10]}")
-            
-            input("\nPress Enter to continue...")
+            # Copy to clipboard instructions
+            print("\n💡 TIP: Copy the activation code above and send via email/WhatsApp")
         
-        elif choice == "3":
-            # View License Details
-            license_key = input("\nEnter License Key: ").strip().upper()
-            details = generator.get_license_details(license_key)
-            
-            if details:
-                print("\n" + "="*70)
-                print("LICENSE DETAILS")
-                print("="*70)
-                print(f"🔑 Key: {details['key']}")
-                print(f"🏪 Customer: {details['customer']}")
-                print(f"📧 Email: {details['email']}")
-                if details.get('phone'):
-                    print(f"📱 Phone: {details['phone']}")
-                print(f"📦 Plan: {details['plan'].upper()}")
-                print(f"📅 Issued: {details['issued_date'][:10]}")
-                print(f"📅 Expires: {details['expiry_date'][:10]}")
-                print(f"✅ Activated: {'Yes' if details.get('activated') else 'No'}")
-                if details.get('activated'):
-                    print(f"🖥️  Machine ID: {details.get('machine_id', 'N/A')}")
-                    print(f"📅 Activation Date: {details.get('activation_date', 'N/A')[:10]}")
-                if details.get('revoked'):
-                    print(f"🚫 REVOKED on {details.get('revoked_date', 'N/A')[:10]}")
-                print("="*70)
-            else:
-                print("\n❌ License not found!")
-            
-            input("\nPress Enter to continue...")
-        
-        elif choice == "4":
-            # Revoke License
-            license_key = input("\nEnter License Key to Revoke: ").strip().upper()
-            confirm = input(f"⚠️  Are you sure you want to revoke {license_key}? (yes/no): ").strip().lower()
-            
-            if confirm == "yes":
-                if generator.revoke_license(license_key):
-                    print("\n✅ License revoked successfully!")
-                else:
-                    print("\n❌ License not found!")
-            else:
-                print("\n❌ Revocation cancelled.")
-            
-            input("\nPress Enter to continue...")
-        
-        elif choice == "5":
-            # Statistics
-            licenses = generator.list_licenses()
-            total = len(licenses)
-            activated = len([l for l in licenses if l.get('activated')])
-            not_activated = total - activated
-            revoked = len([l for l in licenses if l.get('revoked')])
-            
-            basic = len([l for l in licenses if l.get('plan') == 'basic'])
-            pro = len([l for l in licenses if l.get('plan') == 'pro'])
-            enterprise = len([l for l in licenses if l.get('plan') == 'enterprise'])
-            
-            print("\n" + "="*70)
-            print("LICENSE STATISTICS")
-            print("="*70)
-            print(f"\n📊 Total Licenses: {total}")
-            print(f"✅ Activated: {activated}")
-            print(f"⏳ Not Activated: {not_activated}")
-            print(f"🚫 Revoked: {revoked}")
-            print(f"\n📦 Plans:")
-            print(f"   Basic: {basic}")
-            print(f"   Pro: {pro}")
-            print(f"   Enterprise: {enterprise}")
-            print("="*70)
-            
-            input("\nPress Enter to continue...")
-        
-        elif choice == "6":
+        elif choice == '3':
             print("\n👋 Goodbye!")
             break
         
         else:
-            print("\n❌ Invalid choice! Please select 1-6.")
-            input("\nPress Enter to continue...")
-
-
-if __name__ == "__main__":
-    main()
+            print("❌ Invalid choice!")

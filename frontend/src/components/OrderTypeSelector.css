@@ -1,0 +1,52 @@
+.order-type-selector {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  padding: 15px 0;
+  border-bottom: 1px solid #e0e0e0;
+  margin-bottom: 15px;
+}
+
+.order-type-label {
+  font-weight: 600;
+  color: #333;
+  font-size: 14px;
+}
+
+.order-type-buttons {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.order-type-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 20px;
+  border: 2px solid #FF6B35;
+  border-radius: 8px;
+  background: white;
+  color: #FF6B35;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.3s ease;
+}
+
+.order-type-btn:hover {
+  background: #FFE5DC;
+}
+
+.order-type-btn.active {
+  background: #FF6B35;
+  color: white;
+}
+
+.order-type-icon {
+  font-size: 18px;
+}
+
+.order-type-text {
+  font-size: 14px;
+}

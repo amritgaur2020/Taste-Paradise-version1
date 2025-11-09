@@ -1,17 +1,37 @@
-venv/
+# Python
 __pycache__/
+*.py[cod]
 *.pyc
 *.pyo
 *.pyd
 .Python
-mongodb/
+env/
+venv/
+ENV/
+.venv
+
+# React/Node
 node_modules/
+/build
+/dist
 .env
-*.log
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Database
 *.db
 *.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# OS
 .DS_Store
-license.key
-dist/
-build/
-*.egg-info/
+Thumbs.db

@@ -1,6 +1,28 @@
 // Add this at the very top after imports
-const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8002';
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8002';
+const API = `${BACKEND_URL}/api`;
 
+console.log('🔧 Using Backend URL:', BACKEND_URL);
+
+// Make available globally for ALL components
+window.API_BASE_URL = BACKEND_URL;  // ✅ Global fallback
+window.API = API;  // ✅ Global API URL
+
+// ✅ ADD THIS: Configure axios to never cache and add timestamp to all requests
+axios.defaults.headers.common['Cache-Control'] = 'no-cache, no-store, must-revalidate';
+axios.defaults.headers.common['Pragma'] = 'no-cache';
+axios.defaults.headers.common['Expires'] = '0';
+
+// Add timestamp to all GET requests to force fresh data
+axios.interceptors.request.use(config => {
+  if (config.method === 'get') {
+    config.params = {
+      ...config.params,
+      _t: new Date().getTime()
+    };
+  }
+  return config;
+});
 
 import React, { useState, useEffect, createContext, useContext } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
@@ -12,6 +34,13 @@ import PrintInvoice from './components/PrintInvoice';
 import ConfigureSoundboxModal from './components/Payments/ConfigureSoundboxModal';  
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
 import './components/InvoicePrint.css';
+import CustomerDetailsModal from './components/CustomerDetailsModal';
+import OrderTypeSelector from './components/OrderTypeSelector';
+import AddCustomerModal from './components/AddCustomerModal';
+import OpenItemModal from './components/OpenItemModal';
+import DiscountSection from './components/DiscountSection';
+import VegNonVegIcon from './components/VegNonVegIcon';
+import PrintKOT from './components/PrintKOT';
 import {
   Table,
   TableBody,
@@ -76,12 +105,11 @@ import {
   History,
   AlertTriangle,
   Zap,
-} from 'lucide-react';
+}
+ from 'lucide-react';
 import './App.css';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL || 'http://localhost:8002';
-const API = `${BACKEND_URL}/api`;
-console.log('🔧 Using Backend URL:', BACKEND_URL);
+
 
 // Context for sharing state across components
 const RestaurantContext = createContext();
@@ -98,7 +126,7 @@ const TableManagement = ({ onTableSelect }) => {
   const { refreshData, orders } = useRestaurant();
   const [tables, setTables] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [showAddTable, setShowAddTable] = useState(false);
+  const [showAddTable, setShowAddTable] = useState(false); 
   const [newTableData, setNewTableData] = useState({
     table_number: '',
     capacity: 4,
@@ -163,7 +191,15 @@ const TableManagement = ({ onTableSelect }) => {
     }
   };
 
+ 
+  const handleKotClick = (kotData) => {
+  console.log('KOT Clicked:', kotData);
+  setSelectedKot(kotData);
+  setIsPrintModalOpen(true);
+};
   const handleTableClick = async (table) => {
+ 
+
     // Check if table has active orders
     const tableOrders = orders.filter(order => 
       order.table_number === table.table_number && 
@@ -394,6 +430,7 @@ const RestaurantProvider = ({ children }) => {
   const [loading, setLoading] = useState(false);
   const [paymentHistory, setPaymentHistory] = useState([]);
   const [unmatchedPayments, setUnmatchedPayments] = useState([]);
+
   const [paymentStats, setPaymentStats] = useState({
     total_payments: 0,
     matched_payments: 0,
@@ -403,25 +440,48 @@ const RestaurantProvider = ({ children }) => {
   const [showPaymentHistory, setShowPaymentHistory] = useState(false);
   const [loadingPayments, setLoadingPayments] = useState(false);
 
-  const refreshData = async () => {
-    setLoading(true);
-    try {
-      const [ordersRes, menuRes, statsRes, kotsRes] = await Promise.all([
-        axios.get(`${API}/orders`),
-        axios.get(`${API}/menu`),
-        axios.get(`${API}/dashboard`),
-        axios.get(`${API}/kot`)
-      ]);
-      
-      setOrders(ordersRes.data);
-      setMenuItems(menuRes.data);
-      setDashboardStats(statsRes.data);
-      setKots(kotsRes.data);
-    } catch (error) {
-      console.error('Error refreshing data:', error);
-    }
-    setLoading(false);
-  };
+const refreshData = async () => {
+  setLoading(true);
+  try {
+    // ✅ ADD TIMESTAMP to force fresh data - timestamps already added by interceptor
+    // but this ensures cache headers are sent
+    const [ordersRes, menuRes, statsRes, kotsRes] = await Promise.all([
+      axios.get(`${API}/orders`, {
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+        }
+      }),
+      axios.get(`${API}/menu`, {
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+        }
+      }),
+      axios.get(`${API}/dashboard`, {
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+        }
+      }),
+      axios.get(`${API}/kot`, {
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+        }
+      })
+    ]);
+    
+    setOrders(ordersRes.data);
+    setMenuItems(menuRes.data);
+    setDashboardStats(statsRes.data);
+    setKots(kotsRes.data);
+  } catch (error) {
+    console.error('Error refreshing data:', error);
+  }
+  setLoading(false);
+};
+
 
   const fetchDailyReport = async (date) => {
     try {
@@ -555,9 +615,89 @@ const triggerTestWebhook = async () => {
 };
 
 
-  useEffect(() => {
+  // ==================== WEBSOCKET SETUP ====================
+const setupWebSocket = (refreshDataCallback) => {
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsURL = `${wsProtocol}//${window.location.hostname}:8002/ws`;
+    
+    console.log("🔗 Connecting to WebSocket...");
+    
+    const ws = new WebSocket(wsURL);
+    
+    ws.onopen = () => {
+        console.log("✅ WebSocket connected");
+    };
+    
+    ws.onmessage = async (event) => {
+        try {
+            const message = JSON.parse(event.data);
+            console.log("📨 WebSocket message:", message.type, message);
+            
+            // ✅ FOR PAYMENT UPDATES - Use functional setState to get latest state
+            if (message.type === 'payment_updated') {
+                console.log("💳 Payment update detected for order:", message.order_id);
+                
+                // ✅ Use functional setState to access current orders state
+                setOrders(currentOrders => {
+                    console.log("📝 Current orders count:", currentOrders.length);
+                    const updatedOrders = currentOrders.map(order => {
+                        if (order.id === message.order_id) {
+                            console.log("✅ Updating order payment:", order.id);
+                            return {
+                                ...order,
+                                payment_status: message.payment_status,
+                                payment_method: message.payment_method
+                            };
+                        }
+                        return order;
+                    });
+                    return updatedOrders;
+                });
+                return;
+            }
+            
+            // For other events
+            if (['order_created', 'order_updated', 'kot_generated'].includes(message.type)) {
+                console.log(`🔄 ${message.type} - calling refreshData`);
+                await refreshDataCallback();
+            }
+        } catch (error) {
+            console.error("❌ Error parsing WebSocket message:", error);
+        }
+    };
+    
+    ws.onerror = (error) => {
+        console.error("❌ WebSocket error:", error);
+    };
+    
+    ws.onclose = () => {
+        console.log("🔌 WebSocket disconnected");
+        // ✅ DO NOT RECONNECT - prevents infinite loop
+    };
+    
+    return ws;
+};
+
+
+
+
+useEffect(() => {
+    console.log("🚀 RestaurantProvider mounting");
     refreshData();
-  }, []);
+    
+    // ✅ Setup WebSocket ONLY ONCE on mount
+    const ws = setupWebSocket(refreshData);
+    
+    // Cleanup on unmount only
+    return () => {
+        console.log("🔌 Cleaning up WebSocket");
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.close();
+        }
+    };
+}, []); // ✅ Empty dependency array - runs ONLY ONCE
+  
+
 
   const value = {
     orders, setOrders,
@@ -660,6 +800,12 @@ const Dashboard = () => {
   const [selectedTable, setSelectedTable] = useState(null);
   const [showInvoice, setShowInvoice] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState(null);
+
+    // ✅ ADD THIS: Force refresh dashboard data on mount
+  useEffect(() => {
+    console.log('Dashboard mounted - forcing data refresh');
+    refreshData();
+  }, []); // Empty dependency array = runs once on mount
 
   if (loading || !dashboardStats) {
     return <div className="flex justify-center items-center h-96">Loading...</div>;
@@ -960,7 +1106,7 @@ const currentDate = order?.createdat ? new Date(order.createdat) : new Date();
                 <h1 className="text-3xl font-bold text-orange-600">Taste Paradise</h1>
                 <p className="text-gray-600">Restaurant & Billing Service</p>
                 <p className="text-sm text-gray-500">123 Food Street, Flavor City, FC 12345</p>
-                <p className="text-sm text-gray-500">Phone: +91 98765 43210 | Email: info@tasteparadise.com</p>
+                <p className="text-sm text-gray-500">Phone: +91 8218355207 | Email: info@tasteparadise.com</p>
               </div>
               <div className="text-right">
                 <h2 className="text-2xl font-bold text-gray-800">INVOICE</h2>
@@ -1102,7 +1248,7 @@ const currentDate = order?.createdat ? new Date(order.createdat) : new Date();
 
 // Orders Component
 const Orders = () => {
-  const { orders, refreshData } = useRestaurant();
+  const { orders, setOrders, refreshData } = useRestaurant();
   const location = useLocation();
   const [selectedStatus, setSelectedStatus] = useState('all');
   const [showInvoice, setShowInvoice] = useState(false);
@@ -1178,14 +1324,19 @@ const Orders = () => {
     return colors[status] || 'capitalize';
   };
 
-  const updateOrderStatus = async (orderId, newStatus) => {
-    try {
-      await axios.put(`${API}/orders/${orderId}`, { status: newStatus });
-      refreshData();
-    } catch (error) {
-      console.error('Error updating order status:', error);
-    }
-  };
+const updateOrderStatus = async (orderId, newStatus) => {
+  try {
+    const response = await axios.put(`${API}/orders/${orderId}`, { 
+      status: newStatus 
+    });
+    await refreshData();
+    alert(`Order status updated to ${newStatus}`);
+  } catch (error) {
+    console.error('Error updating order status:', error);
+    alert('Failed: ' + (error.response?.data?.detail || error.message));
+  }
+};
+
 
   const cancelOrder = async (orderId, customerName) => {
     const confirmCancel = window.confirm(
@@ -1203,23 +1354,37 @@ const Orders = () => {
     }
   };
 
-  const updatePaymentStatus = async (orderId, paymentStatus, paymentMethod = null) => {
-    try {
-      const updateData = { payment_status: paymentStatus }; // Fixed: use payment_status
-      if (paymentMethod) updateData.payment_method = paymentMethod; // Fixed: use payment_method
-      
-      await axios.put(`${API}/orders/${orderId}/pay`, {
-  payment_status: paymentStatus,
-  payment_method: paymentMethod
-});
+// ✅ OPTIMISTIC UPDATE - Update UI immediately without waiting for API
+const updatePaymentStatusOptimistic = async (orderId, paymentStatus, paymentMethod = null) => {
+  try {
+    const updatedOrders = orders.map(order =>
+      order.id === orderId 
+        ? { 
+            ...order, 
+            paymentstatus: paymentStatus, 
+            paymentmethod: paymentMethod 
+          }
+        : order
+    );
+    setOrders(updatedOrders);
 
-      refreshData();
-      alert(`Payment marked as ${paymentStatus}!`);
-    } catch (error) {
-      console.error('Error updating payment status:', error);
-      alert('Error updating payment status');
-    }
-  };
+    const response = await axios.put(`${API}/orders/${orderId}/pay`, {
+      payment_status: paymentStatus,
+      payment_method: paymentMethod
+    });
+    
+    await refreshData();
+    alert(`Payment marked as ${paymentStatus}`);
+    
+  } catch (error) {
+    console.error('Error updating payment status:', error);
+    await refreshData();
+    alert('Payment failed: ' + (error.response?.data?.detail || error.message));
+  }
+};
+
+
+
 
   const generateBill = (order) => {
     setSelectedOrder(order);
@@ -1374,7 +1539,7 @@ const Orders = () => {
                                 <Button
                                   size="sm"
                                   variant="outline"
-                                  onClick={() => updatePaymentStatus(order.id, 'paid', 'cash')}
+                                  onClick={() => updatePaymentStatusOptimistic(order.id, 'paid', 'cash')}
                                   className="text-xs bg-green-50 text-green-700 hover:bg-green-100"
                                 >
                                   💰 Cash
@@ -1382,7 +1547,7 @@ const Orders = () => {
                                 <Button
                                   size="sm"
                                   variant="outline"
-                                  onClick={() => updatePaymentStatus(order.id, 'paid', 'online')}
+                                  onClick={() => updatePaymentStatusOptimistic(order.id, 'paid', 'online')}
                                   className="text-xs bg-blue-50 text-blue-700 hover:bg-blue-100"
                                 >
                                   💳 Online
@@ -1443,11 +1608,39 @@ const NewOrder = () => {
   const [customerName, setCustomerName] = useState('');
   const [tableNumber, setTableNumber] = useState(location.state?.selectedTable || '');
   const [selectedCategory, setSelectedCategory] = useState('all');
+  const [searchQuery, setSearchQuery] = useState('');
+  
 
   const categories = ['all', ...new Set(menuItems.map(item => item.category))];
-  const filteredItems = selectedCategory === 'all' 
-    ? menuItems.filter(item => item.is_available)
-    : menuItems.filter(item => item.category === selectedCategory && item.is_available);
+const filteredItems = menuItems.filter(item => {
+  // Filter by availability
+  if (!item.is_available) return false;
+  
+  // Filter by category
+  if (selectedCategory !== 'all' && item.category !== selectedCategory) {
+    return false;
+  }
+  
+  // Filter by search query
+  if (searchQuery) {
+    const query = searchQuery.toLowerCase();
+    return item.name.toLowerCase().includes(query) || 
+           item.description.toLowerCase().includes(query);
+  }
+  
+  return true;
+});
+
+
+  // ADD THESE NEW LINES after line 1451:
+  const [orderType, setOrderType] = useState('dine-in');
+  const [selectedCustomer, setSelectedCustomer] = useState(null);
+  const [phone, setPhone] = useState('');
+  const [address, setAddress] = useState('');
+  const [discount, setDiscount] = useState(null);
+  const [showCustomerModal, setShowCustomerModal] = useState(false);
+  const [showOpenItemModal, setShowOpenItemModal] = useState(false);
+  const [viewingCustomer, setViewingCustomer] = useState(null);
 
   const addToCart = (menuItem) => {
     const existingItem = cart.find(item => item.menu_item_id === menuItem.id);
@@ -1463,10 +1656,39 @@ const NewOrder = () => {
         menu_item_name: menuItem.name,
         quantity: 1,
         price: menuItem.price,
-        special_instructions: ''
+        special_instructions: '',
+        food_type: menuItem.food_type || 'veg',
+        is_custom_item: false
       }]);
     }
   };
+
+  const addCustomItemToCart = (customItem) => {
+  setCart([...cart, customItem]);
+};
+
+// NEW: Handle customer selection
+const handleCustomerSelect = (customer) => {
+  setSelectedCustomer(customer);
+  setCustomerName(customer.name);
+  setPhone(customer.phone);
+  
+  // Auto-fill address if delivery order and customer has default address
+  if (orderType === 'delivery' && customer.addresses && customer.addresses.length > 0) {
+    const defaultAddress = customer.addresses.find(addr => addr.is_default) || customer.addresses[0];
+    setAddress(`${defaultAddress.line1}, ${defaultAddress.city}, ${defaultAddress.pincode}`);
+  }
+};
+
+// NEW: Handle discount changes
+const handleDiscountChange = (newDiscount) => {
+  setDiscount(newDiscount);
+};
+
+const handleDiscountRemove = () => {
+  setDiscount(null);
+};
+
 
   const updateQuantity = (menuItemId, newQuantity) => {
     if (newQuantity === 0) {
@@ -1480,86 +1702,208 @@ const NewOrder = () => {
     }
   };
 
-  const getTotalAmount = () => {
+  const getSubtotal = () => {
     return cart.reduce((total, item) => total + (item.quantity * item.price), 0);
+  };
+  const getTax = () => {
+    const subtotal = getSubtotal();
+    const discountAmount = discount ? discount.amount : 0;
+    const taxableAmount = subtotal - discountAmount;
+    return taxableAmount * 0.05; // 5% GST
+  };
+
+  const getTotalAmount = () => {
+    const subtotal = getSubtotal();
+    const discountAmount = discount ? discount.amount : 0;
+    const tax = getTax();
+    return subtotal - discountAmount + tax;
   };
 
   const submitOrder = async () => {
-    if (cart.length === 0) {
-      alert('Please add items to cart');
-      return;
-    }
+  if (cart.length === 0) {
+    alert('Please add items to cart');
+    return;
+  }
 
-    try {
-      await axios.post(`${API}/orders`, {
-        customer_name: customerName,
-        table_number: tableNumber,
-        items: cart
-      });
-      
-      // Reset form
-      setCart([]);
-      setCustomerName('');
-      setTableNumber('');
-      alert('Order created successfully!');
-      refreshData();
-    } catch (error) {
-      console.error('Error creating order:', error);
-      alert('Error creating order');
-    }
-  };
+  // Validation based on order type
+  if (orderType === 'dine-in' && !tableNumber) {
+    alert('Please enter table number for dine-in orders');
+    return;
+  }
+
+  if (orderType === 'delivery' && !address) {
+    alert('Please enter delivery address');
+    return;
+  }
+
+  try {
+    const orderData = {
+      order_type: orderType,
+      customer_id: selectedCustomer?.customer_id || null,
+      customer_name: customerName || 'Walk-in',
+      phone: phone || null,
+      address: address || null,
+      table_number: orderType === 'dine-in' ? tableNumber : null,
+      items: cart,
+      discount: discount || null,
+      gst_applicable: true
+    };
+
+    await axios.post(`${API_BASE_URL}/api/orders`, orderData);
+
+    // Reset form
+    setCart([]);
+    setCustomerName('');
+    setTableNumber('');
+    setPhone('');
+    setAddress('');
+    setDiscount(null);
+    setSelectedCustomer(null);
+    setOrderType('dine-in');
+
+    alert('Order created successfully!');
+    refreshData();
+  } catch (error) {
+    console.error('Error creating order:', error);
+    alert('Error creating order: ' + (error.response?.data?.detail || error.message));
+  }
+};
+
 
   return (
     <div className="max-w-7xl mx-auto p-6">
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Menu Items */}
         <div className="lg:col-span-2 space-y-6">
-          <div className="flex justify-between items-center">
-            <h2 className="text-3xl font-bold text-gray-900">New Order</h2>
-            <Select value={selectedCategory} onValueChange={setSelectedCategory}>
-              <SelectTrigger className="w-48">
-                <SelectValue placeholder="Select category" />
-              </SelectTrigger>
-              <SelectContent>
-                {categories.map(category => (
-                  <SelectItem key={category} value={category}>
-                    {category === 'all' ? 'All Categories' : category}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          <div className="flex justify-between items-center gap-4">
+  <h2 className="text-3xl font-bold text-gray-900">New Order</h2>
+  
+  <div className="flex items-center gap-3">
+    {/* Search Bar */}
+    <div className="relative">
+      <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-gray-400" />
+      <Input
+        type="text"
+        placeholder="Search items..."
+        value={searchQuery}
+        onChange={(e) => setSearchQuery(e.target.value)}
+        className="pl-10 w-64"
+      />
+      {searchQuery && (
+        <button
+          onClick={() => setSearchQuery('')}
+          className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 hover:text-gray-600"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      )}
+    </div>
+    
+    {/* Category Dropdown */}
+    <Select value={selectedCategory} onValueChange={setSelectedCategory}>
+      <SelectTrigger className="w-48">
+        <SelectValue placeholder="Select category" />
+      </SelectTrigger>
+      <SelectContent>
+        {categories.map(category => (
+          <SelectItem key={category} value={category}>
+            {category === 'all' ? 'All Categories' : category}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  </div>
+</div>
+
+          {/* NEW: Order Type Selector */}
+          <OrderTypeSelector 
+            selectedType={orderType} 
+            onTypeChange={setOrderType} 
+         />
+
+          {/* NEW: Action Buttons */}
+          <div className="flex gap-3 mt-4">
+            <Button
+              variant="outline"
+              className="flex items-center gap-2"
+              onClick={() => setShowCustomerModal(true)}
+            >
+              <Users className="h-4 w-4" />
+              Add Customer
+            </Button>
+            <Button
+              variant="outline"
+              className="flex items-center gap-2"
+              onClick={() => setShowOpenItemModal(true)}
+            >
+              <Plus className="h-4 w-4" />
+              Open Item
+            </Button>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {filteredItems.map(item => (
-              <Card key={item.id} className="hover:shadow-lg transition-shadow cursor-pointer">
-                <CardContent className="p-4">
-                  <div className="flex justify-between items-start mb-3">
-                    <div className="flex-1">
-                      <h3 className="font-semibold text-lg">{item.name}</h3>
-                      <p className="text-gray-600 text-sm mb-2">{item.description}</p>
-                      <div className="flex items-center justify-between">
-                        <span className="text-2xl font-bold text-orange-600">₹{item.price}</span>
-                        <Badge variant="outline" className="text-xs">{item.category}</Badge>
-                      </div>
-                    </div>
-                  </div>
-                  <Button onClick={() => addToCart(item)} className="w-full bg-orange-600 hover:bg-orange-700">
-                    Add to Cart
-                  </Button>
-                </CardContent>
-              </Card>
+              <Card 
+  key={item.id} 
+  className="hover:shadow-lg transition-shadow cursor-pointer hover:border-orange-300 hover:bg-orange-50"
+  onClick={() => addToCart(item)}
+>
+  <CardContent className="p-4">
+    <div className="flex justify-between items-start">
+      <div className="flex-1">
+        <div className="flex items-center gap-2 mb-2">
+          <VegNonVegIcon type={item.food_type || 'veg'} />
+          <h3 className="font-semibold text-lg">{item.name}</h3>
+        </div>
+        <p className="text-gray-600 text-sm mb-3">{item.description}</p>
+        <div className="flex items-center justify-between">
+          <span className="text-2xl font-bold text-orange-600">₹{item.price}</span>
+          <Badge variant="outline" className="text-xs">{item.category}</Badge>
+        </div>
+      </div>
+    </div>
+  </CardContent>
+</Card>
+
             ))}
           </div>
         </div>
 
         {/* Cart */}
-        <div className="p-6 space-y-6">
+        <div className="space-y-6 p-6 lg:sticky lg:top-6 lg:h-fit lg:overflow-y-auto lg:max-h-[calc(100vh-8rem)]">
           <Card>
             <CardHeader>
               <CardTitle>Order Details</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
+                {/* NEW: Show selected customer info */}
+                {selectedCustomer && (
+                  <div className="p-3 bg-green-50 border border-green-200 rounded-lg">
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <p className="font-semibold text-green-800">{selectedCustomer.name}</p>
+                        <p className="text-sm text-green-600">{selectedCustomer.phone}</p>
+                        {selectedCustomer.order_history?.total_orders > 0 && (
+                          <p className="text-xs text-green-500 mt-1">
+                            {selectedCustomer.order_history.total_orders} previous orders
+                          </p>
+                        )}
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => {
+                          setSelectedCustomer(null);
+                          setCustomerName('');
+                          setPhone('');
+                          setAddress('');
+                        }}
+                      >
+                        <X className="h-4 w-4" />
+                      </Button>
+                  </div>
+                </div>
+              )}
               <div>
                 <Label htmlFor="customer-name">Customer Name</Label>
                 <Input
@@ -1569,16 +1913,47 @@ const NewOrder = () => {
                   placeholder="Enter customer name"
                 />
               </div>
-              <div>
-                <Label htmlFor="table-number">Table Number</Label>
-                <Input
-                  id="table-number"
-                  value={tableNumber}
-                  onChange={(e) => setTableNumber(e.target.value)}
-                  placeholder="Enter table number"
-                />
-              </div>
-            </CardContent>
+              {/* Conditional fields based on order type */}
+{orderType === 'dine-in' && (
+  <div>
+    <Label htmlFor="table-number">Table Number *</Label>
+    <Input
+      id="table-number"
+      value={tableNumber}
+      onChange={(e) => setTableNumber(e.target.value)}
+      placeholder="Enter table number"
+      required
+    />
+  </div>
+)}
+
+{(orderType === 'takeaway' || orderType === 'delivery') && (
+  <div>
+    <Label htmlFor="phone">Phone Number</Label>
+    <Input
+      id="phone"
+      value={phone}
+      onChange={(e) => setPhone(e.target.value)}
+      placeholder="+91-9876543210"
+    />
+  </div>
+)}
+
+{orderType === 'delivery' && (
+  <div>
+    <Label htmlFor="address">Delivery Address *</Label>
+    <Textarea
+      id="address"
+      value={address}
+      onChange={(e) => setAddress(e.target.value)}
+      placeholder="Enter delivery address"
+      rows={3}
+      required
+    />
+  </div>
+)}
+</CardContent>
+
           </Card>
 
           <Card>
@@ -1591,11 +1966,20 @@ const NewOrder = () => {
               ) : (
                 <div className="space-y-4">
                   {cart.map(item => (
-                    <div key={item.menu_item_id} className="flex items-center justify-between p-2 border rounded">
-                      <div className="flex-1">
-                        <h4 className="font-semibold">{item.menu_item_name}</h4>
-                        <p className="text-sm text-gray-600">₹{item.price} each</p>
-                      </div>
+  <div key={item.menu_item_id} className="flex items-center justify-between p-2 border rounded">
+    <div className="flex-1">
+      <div className="flex items-center gap-2">
+        <VegNonVegIcon type={item.food_type || 'veg'} size="12px" />
+        <h4 className="font-semibold">{item.menu_item_name}</h4>
+        {item.is_custom_item && (
+          <Badge variant="outline" className="text-xs bg-yellow-50">
+            Custom
+          </Badge>
+        )}
+      </div>
+      <p className="text-sm text-gray-600">₹{item.price} each</p>
+    </div>
+
                       <div className="flex items-center space-x-2">
                         <Button 
                           size="sm" 
@@ -1615,33 +1999,90 @@ const NewOrder = () => {
                       </div>
                     </div>
                   ))}
-                  <div className="border-t pt-4">
-                    <div className="flex justify-between items-center text-lg font-bold">
-                      <span>Total:</span>
-                      <span className="text-orange-600">₹{getTotalAmount().toFixed(2)}</span>
-                    </div>
-                  </div>
-                  <Button 
-                    onClick={submitOrder} 
-                    className="w-full mt-4 bg-orange-600 hover:bg-orange-700"
-                  >
-                    Place Order
-                  </Button>
+                  {/* NEW: Discount Section */}
+<div className="border-t pt-4">
+  <DiscountSection
+    subtotal={getSubtotal()}
+    discount={discount}
+    onDiscountChange={handleDiscountChange}
+    onDiscountRemove={handleDiscountRemove}
+  />
+</div>
+
+{/* Totals */}
+<div className="border-t pt-4 space-y-2">
+  <div className="flex justify-between text-sm">
+    <span>Subtotal</span>
+    <span>₹{getSubtotal().toFixed(2)}</span>
+  </div>
+
+  {discount && (
+    <div className="flex justify-between text-sm text-orange-600">
+      <span>Discount</span>
+      <span>- ₹{discount.amount.toFixed(2)}</span>
+    </div>
+  )}
+
+  <div className="flex justify-between text-sm">
+    <span>Tax (5%)</span>
+    <span>₹{getTax().toFixed(2)}</span>
+  </div>
+
+  <div className="flex justify-between items-center text-lg font-bold border-t pt-2">
+    <span>Total</span>
+    <span className="text-orange-600">₹{getTotalAmount().toFixed(2)}</span>
+  </div>
+</div>
+
+<Button
+  onClick={submitOrder}
+  className="w-full mt-4 bg-orange-600 hover:bg-orange-700"
+  disabled={cart.length === 0}
+>
+  Place Order
+</Button>
+
                 </div>
               )}
             </CardContent>
-          </Card>
-        </div>
-      </div>
+                </Card>
     </div>
-  );
+  </div>
+
+  {/* NEW: Modals */}
+  <AddCustomerModal 
+  isOpen={showCustomerModal}
+  onClose={() => setShowCustomerModal(false)}
+  onCustomerSelect={handleCustomerSelect}
+  onViewCustomer={(customer) => setViewingCustomer(customer)}
+/>
+
+
+  <OpenItemModal
+    isOpen={showOpenItemModal}
+    onClose={() => setShowOpenItemModal(false)}
+    onAddItem={addCustomItemToCart}
+    categories={categories.filter(cat => cat !== 'all')}
+  />
+        {/* ✅ ADD THIS NEW MODAL */}
+      {viewingCustomer && (
+        <CustomerDetailsModal
+          customer={viewingCustomer}
+          onClose={() => setViewingCustomer(null)}
+        />
+      )}
+</div>
+);
 };
+
 
 // KOT Component
 const KOTScreen = () => {
   const { orders, kots, refreshData } = useRestaurant();
   const location = useLocation();
   const [filterDate, setFilterDate] = useState(null);
+  const [selectedKot, setSelectedKot] = useState(null);              // ← ADD THIS
+  const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
   const [highlightKot, setHighlightKot] = useState(null);
 
   // Handle navigation state from Daily Report
@@ -1745,25 +2186,42 @@ const KOTScreen = () => {
           </CardHeader>
           <CardContent>
             {filteredKots.map(kot => (
-              <div key={kot.id} className={`border rounded p-4 mb-4 bg-gray-50 ${highlightKot === kot.id ? 'bg-yellow-100 border-yellow-300' : ''}`}>
-                <div className="flex justify-between items-center mb-2">
-                  <h3 className="font-semibold">{kot.order_number}</h3>
-                  <Badge className="bg-green-100 text-green-800">
-                    {kot.status}
-                  </Badge>
-                </div>
-                <p className="text-sm text-gray-600 mb-2">
-                  Table {kot.table_number || 'N/A'} - {new Date(kot.created_at).toLocaleTimeString()}
-                </p>
-                <div className="space-y-1">
-                  {kot.items.map((item, idx) => (
-                    <div key={idx} className="flex justify-between text-sm">
-                      <span>{item.quantity}x {item.menu_item_name}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ))}
+  <div 
+    key={kot._id} 
+    className="border rounded p-4 mb-4 bg-gray-50 ${highlightKot === kot._id ? 'ring-2 ring-orange-500' : ''}"
+    onClick={() => {
+      setSelectedKot(kot);
+      setIsPrintModalOpen(true);
+    }}
+    style={{ cursor: 'pointer' }}
+  >
+    <div className="flex justify-between items-center mb-2">
+      <h3 className="font-semibold">{kot.order_number}</h3>
+      <Badge className="bg-green-100 text-green-800">{kot.status}</Badge>
+    </div>
+    <p className="text-sm text-gray-600 mb-2">
+      Table {kot.table_number || 'N/A'} - {new Date(kot.created_at).toLocaleTimeString()}
+    </p>
+    <div className="space-y-1">
+      {kot.items.map((item, idx) => (
+        <div key={idx} className="flex justify-between items-sm">
+          <span>{item.quantity}x {item.menu_item_name}</span>
+        </div>
+      ))}
+    </div>
+  </div>
+))}
+
+<PrintKOT 
+  kot={selectedKot}
+  isOpen={isPrintModalOpen}
+  onClose={() => {
+    setIsPrintModalOpen(false);
+    setSelectedKot(null);
+  }}
+  API={API}
+/>
+
           </CardContent>
         </Card>
       </div>

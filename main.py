@@ -2,7 +2,7 @@
 app_started = False
 
 # ==================== LICENSE SYSTEM ====================
-from license_system import check_license
+from license_validator import OfflineLicenseValidator
 # ========================================================
 
 import os
@@ -71,7 +71,7 @@ import os, sys, subprocess, time, threading, webview
 import platform
 import asyncio
 from pathlib import Path
-from fastapi import FastAPI, APIRouter, HTTPException, Form , Body
+from fastapi import FastAPI, APIRouter, HTTPException, Form , Body, WebSocket, WebSocketDisconnect
 from passlib.context import CryptContext
 from datetime import datetime
 from fastapi.staticfiles import StaticFiles
@@ -95,6 +95,41 @@ from datetime import datetime, timedelta
 import pytz 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from routes.payment_routes import router as payment_router, init_payment_routes
+
+
+
+
+
+# ==================== WEBSOCKET CONNECTION MANAGER ====================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+        logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
+
+    async def broadcast(self, message: dict):
+        """Send message to all connected clients"""
+        disconnected = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                logger.error(f"Error sending to WebSocket: {e}")
+                disconnected.append(connection)
+        
+        # Remove disconnected clients
+        for conn in disconnected:
+            if conn in self.active_connections:
+                self.active_connections.remove(conn)
+
+manager = ConnectionManager()
 
 
 # ==================== CONFIG ====================
@@ -161,6 +196,13 @@ class OrderItem(BaseModel):
     quantity: int
     price: float
     special_instructions: str = ""
+    food_type: str = "veg"  
+    is_custom_item: bool = False
+    category: Optional[str] = "" 
+    description: Optional[str] = ""
+    taxable: bool = True  
+    added_by: Optional[str] = ""
+    added_at: Optional[datetime] = None
 
 class MenuItem(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -168,6 +210,7 @@ class MenuItem(BaseModel):
     description: str = ""
     price: float
     category: str
+    food_type: str = "veg"
     image_url: Optional[str] = None
     is_available: bool = True
     preparation_time: int = 15
@@ -178,6 +221,7 @@ class MenuItemCreate(BaseModel):
     description: str = ""
     price: float
     category: str
+    food_type: str = "veg"
     image_url: Optional[str] = None
     preparation_time: int = 15
 
@@ -185,13 +229,68 @@ def generate_order_id():
     """Generate a short 8-character order ID like '68786a3c'"""
     return secrets.token_hex(4)  # Generates 8 hex characters
 
+# ==================== CUSTOMER MODELS ====================
+class Address(BaseModel):
+    type: str = "home"  # home, work, other
+    line1: str
+    line2: Optional[str] = ""
+    landmark: Optional[str] = ""
+    city: str
+    pincode: str
+    is_default: bool = True
+
+class OrderHistory(BaseModel):
+    total_orders: int = 0
+    total_spent: float = 0.0
+    average_order_value: float = 0.0
+    last_order_date: Optional[datetime] = None
+    favorite_items: List[str] = []
+
+class CustomerCreate(BaseModel):
+    name: str
+    phone: str
+    email: Optional[str] = ""
+    addresses: List[Address] = []
+
+class CustomerUpdate(BaseModel):
+    name: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    addresses: Optional[List[Address]] = None
+    status: Optional[str] = None
+
+class Customer(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    customer_id: str
+    name: str
+    phone: str
+    email: Optional[str] = ""
+    addresses: List[Address] = []
+    order_history: OrderHistory = OrderHistory()
+    loyalty_points: int = 0
+    status: str = "active"  # active, inactive
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+# ==================== NEW DISCOUNT MODEL ====================
+class Discount(BaseModel):
+    type: str  # percentage, fixed
+    value: float
+    reason: Optional[str] = ""
+    amount: float
+
 class Order(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     order_id: str = Field(default_factory=generate_order_id)
+    order_type: str = "dine-in" 
+    customer_id: Optional[str] = None 
     customer_name: str = ""
+    phone: Optional[str] = None
+    address: Optional[str] = None
     table_number: Optional[str] = None
     items: List[OrderItem]
     total_amount: float
+    discount: Optional[Discount] = None
     gst_applicable: bool = False  
     gst_amount: float = 0.0
     final_amount: float = 0.0 
@@ -204,9 +303,14 @@ class Order(BaseModel):
     kot_generated: bool = False
 
 class OrderCreate(BaseModel):
+    order_type: str = "dine-in"
+    customer_id: Optional[str] = None
     customer_name: str = ""
+    phone: Optional[str] = None
+    address: Optional[str] = None
     table_number: Optional[str] = None
     items: List[OrderItem]
+    discount: Optional[Discount] = None
     gst_applicable: bool = False 
 
 class OrderUpdate(BaseModel):
@@ -282,6 +386,10 @@ class Admin(BaseModel):
     admin_id: str = Field(..., min_length=3)
     password: str = Field(..., min_length=6)
     created_at: Optional[datetime] = None
+
+# ==================== NEW CUSTOMER MODELS ====================
+
+
 
 
 # ==================== HELPER FUNCTIONS ====================
@@ -431,20 +539,165 @@ def stop_mongodb():
     if mongodb_process:
         mongodb_process.terminate()
         mongodb_process.wait()
+# ============================================================
+# OFFLINE LICENSE VALIDATION FUNCTION
+# ============================================================
+from license_validator import OfflineLicenseValidator
+
+def verify_license():
+    """
+    Verify TasteParadise license on startup (OFFLINE)
+    Returns True if valid, False otherwise
+    """
+    validator = OfflineLicenseValidator()
+    
+    # Check existing license
+    is_valid, license_data, message = validator.validate_existing_license()
+    
+    if is_valid:
+        # License is valid - show status
+        print("\n" + "="*70)
+        print("🔒 TASTEPARADISE LICENSE VERIFICATION")
+        print("="*70)
+        print(f"✅ {message}")
+        print(f"   License Key: {license_data.get('license_key')}")
+        print(f"   Expires: {license_data.get('expiry_date', 'Never')[:10]}")
+        print(f"   Machine ID: {license_data.get('machine_id')}")
+        print("="*70)
+        return True
+    
+    # No valid license - need activation
+    print("\n" + "="*70)
+    print("🔒 TASTEPARADISE LICENSE VERIFICATION")
+    print("="*70)
+    print(f"\n⚠️  {message}")
+    print("\n" + "="*70)
+    print("🔐 LICENSE ACTIVATION")
+    print("="*70)
+    
+    # Show machine ID
+    machine_id = validator.machine_id
+    print(f"\n🔑 Your Machine ID: {machine_id}")
+    print("\nℹ️ ACTIVATION STEPS:")
+    print("  1. Contact support with your Machine ID")
+    print("     📧 Email: gaurhariom60@gmail.com")
+    print("     📱 Phone: +91 82183 55207")
+    print("  2. Receive activation code from support")
+    print("  3. Enter activation code below")
+    print("-"*70)
+    
+    activation_code = input("\n🔓 Enter Activation Code: ").strip()
+    
+    if not activation_code:
+        print("\n❌ Activation code is required!")
+        return False
+    
+    # Validate activation code
+    print("\n⏳ Validating activation code...")
+    is_valid, license_data, error = validator.validate_activation_code(activation_code)
+    
+    if not is_valid:
+        print(f"\n" + "="*70)
+        print("❌ ACTIVATION FAILED!")
+        print("="*70)
+        print(f"   Reason: {error}")
+        print("\n📞 Contact support: gaurhariom60@gmail.com")
+        print("="*70)
+        return False
+    
+    # Save license
+    if validator.save_license(license_data):
+        print("\n" + "="*70)
+        print("✅ LICENSE ACTIVATED SUCCESSFULLY!")
+        print("="*70)
+        print(f"   License Key: {license_data['license_key']}")
+        print(f"   Expires: {license_data['expiry_date'][:10]}")
+        print(f"   Machine ID: {license_data['machine_id']}")
+        print("="*70)
+        return True
+    else:
+        print("\n⚠️ License validated but could not save to file")
+        return True
+
+
+# ==================== CACHE CONTROL MIDDLEWARE ====================
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
+
+class NoCacheMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        response: Response = await call_next(request)
+        
+        # Never cache HTML files
+        if request.url.path.endswith('.html') or request.url.path == '/':
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            response.headers["Pragma"] = "no-cache"
+            response.headers["Expires"] = "0"
+        
+        # Cache JS/CSS for 1 hour only
+        elif request.url.path.endswith(('.js', '.css')):
+            response.headers["Cache-Control"] = "public, max-age=3600"
+        
+        # Cache other static files for 1 week
+        else:
+            response.headers["Cache-Control"] = "public, max-age=604800"
+        
+        return response
 
 # ==================== FASTAPI APP ====================
 app = FastAPI(title="Taste Paradise API", version="1.0.0")
+from routes.kot_printer import routes as kot_routes
+
 api_router = APIRouter(prefix="/api")
 
+# ✅ ADD THIS NEW MIDDLEWARE FOR API CACHE CONTROL
+@app.middleware("http")
+async def add_cache_control_headers(request, call_next):
+    response = await call_next(request)
+    # Never cache API responses
+    if request.url.path.startswith("/api"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
+# ADD MIDDLEWARE FIRST (before other middlewares)
+app.add_middleware(NoCacheMiddleware)
+
 app.include_router(payment_router)
+app.include_router(kot_routes)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8002",
+        "http://127.0.0.1:8002",
+        "http://127.0.0.1",
+        "http://localhost",
+        "*"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
 )
+
+# ==================== WEBSOCKET ENDPOINT ====================
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive and receive messages if needed
+            data = await websocket.receive_text()
+            logger.info(f"Received WebSocket message: {data}")
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        manager.disconnect(websocket)
+
 
 scheduler = AsyncIOScheduler()
 
@@ -477,7 +730,32 @@ async def startup():
             logger.info(f"Connected to database successfully (attempt {attempt + 1})")
             init_payment_routes(db)
             logger.info("Payment routes initialized successfully")
+
+     # ============================================================
+            # 🌐 CLOUD SYNC SERVICE INITIALIZATION
+            # ============================================================
+        
+            try:
+                from cloud_sync_service import init_cloud_sync
+                from license_cloud_api import license_system
+                
+                # Get license key from local file
+                local_license = license_system.load_local_license()
+                if local_license:
+                    license_key = local_license.get('key')
+                    logger.info(f"Initializing cloud sync for license: {license_key[:20]}...")
+                    
+                    # Initialize cloud sync service
+                    cloud_sync = init_cloud_sync(license_key)
+                    logger.info("✅ Cloud sync service started successfully")
+                else:
+                    logger.warning("⚠️ No license found - cloud sync disabled")
+            except Exception as e:
+                logger.warning(f"⚠️ Cloud sync initialization failed: {e}")
+                # Continue without cloud sync (non-critical)
+            # ============================================================                    
             break
+        
             
         except Exception as e:
             if attempt < max_retries - 1:
@@ -739,14 +1017,22 @@ async def create_order(order_data: OrderCreate):
     
     order_dict = prepare_for_mongo(order.model_dump())
     await db.orders.insert_one(order_dict)
-    
+
     if order.table_number:
         await db.tables.update_one(
             {"table_number": order.table_number},
             {"$set": {"status": "occupied", "current_order_id": order.id}},
         )
-    
+
+    # Broadcast order creation to all connected clients
+    await manager.broadcast({
+        "type": "order_created",
+        "order_id": order.id,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+
     return order
+   
 
 
 @api_router.get("/orders", response_model=List[Order])
@@ -826,6 +1112,11 @@ async def update_order(order_id: str, order_data: OrderUpdate = Body(...)):
             raise HTTPException(status_code=404, detail="Order not found")
         
         logger.info(f"Order {order_id} updated successfully")
+        await manager.broadcast({
+            "type": "order_updated",
+            "order_id": order_id,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
         return Order(**parse_from_mongo(updated))
         
     except Exception as e:
@@ -862,6 +1153,14 @@ async def pay_order(order_id: str, payment_data: dict = Body(...)):
     if updated is None:
         raise HTTPException(status_code=404, detail="Order not found")
     logger.info(f"Order {order_id} payment updated successfully")
+    await manager.broadcast({
+        "type": "payment_updated",
+        "order_id": order_id,
+        "payment_status": payment_status,
+        "payment_method": payment_method,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
+    logger.info(f"Broadcast sent for order {order_id}")  # Add logging to debug
     return {"message": "Payment processed and order marked as served", "order": parse_from_mongo(updated)}
 
 @api_router.put("/orders/{order_id}/cancel")
@@ -897,7 +1196,12 @@ async def generate_kot(order_id: str):
     kot_dict = prepare_for_mongo(kot.model_dump())
     await db.kots.insert_one(kot_dict)
     await db.orders.update_one({"id": order_id}, {"$set": {"kot_generated": True}})
-    
+    await manager.broadcast({
+        "type": "kot_generated",
+        "order_id": order_id,
+        "kot_id": kot.id,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    })
     return kot
 
 @api_router.get("/kot", response_model=List[KOT])
@@ -1065,6 +1369,186 @@ async def delete_table(table_id: str):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Table not found")
     return {"message": "Table deleted successfully"}
+
+# ==================== CUSTOMER ENDPOINTS ====================
+# ================ CUSTOMER ENDPOINTS ================
+
+@api_router.post("/customers", response_model=Customer)
+async def create_customer(customer: CustomerCreate):
+    """Create a new customer"""
+    try:
+        # Check if phone already exists
+        existing = await db.customers.find_one({"phone": customer.phone})
+        if existing:
+            raise HTTPException(status_code=400, detail="Customer with this phone number already exists")
+        
+        customer_dict = customer.dict()
+        customer_dict["id"] = str(uuid.uuid4())
+        customer_dict["customer_id"] = f"CUST-{str(uuid.uuid4())[:8]}"
+        customer_dict["created_at"] = datetime.now(timezone.utc)
+        customer_dict["updated_at"] = datetime.now(timezone.utc)
+        customer_dict["order_history"] = {"total_orders": 0, "total_spent": 0.0, "average_order_value": 0.0, "last_order_date": None, "favorite_items": []}
+        customer_dict["loyalty_points"] = 0
+        customer_dict["status"] = "active"
+        
+        customer_dict = prepare_for_mongo(customer_dict)
+        result = await db.customers.insert_one(customer_dict)
+        
+        created_customer = await db.customers.find_one({"_id": result.inserted_id})
+        logger.info(f"Customer created: {customer.phone}")
+        
+        return Customer.parse_from_mongo(created_customer)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating customer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/customers/search", response_model=List[Customer])
+async def search_customers(query: str):
+    """Search customers by name or phone"""
+    try:
+        if not query or len(query) < 2:
+            return []
+        
+        import re
+        regex_pattern = re.compile(query, re.IGNORECASE)
+        
+        customers_cursor = db.customers.find({
+            "$or": [
+                {"name": {"$regex": regex_pattern}},
+                {"phone": {"$regex": query}},
+                {"email": {"$regex": regex_pattern}}
+            ],
+            "status": "active"
+        }).limit(10)
+        
+        customers = []
+        async for customer in customers_cursor:
+            customers.append(Customer.parse_obj(customer))
+        
+        return customers
+    except Exception as e:
+        logger.error(f"Error searching customers: {e}")
+        return []
+
+
+@api_router.get("/customers/{customer_id}", response_model=Customer)
+async def get_customer(customer_id: str):
+    """Get customer by ID"""
+    try:
+        customer = await db.customers.find_one({"customer_id": customer_id})
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        return Customer.parse_obj(customer)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting customer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/customers/{customer_id}/history")
+async def get_customer_history(customer_id: str):
+    """Get customer order history and spending statistics"""
+    try:
+        # Fetch customer info
+        customer = await db.customers.find_one({"customer_id": customer_id})
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        
+        # Fetch all orders for this customer
+        all_orders_cursor = db.orders.find({"customer_id": customer_id}).sort("created_at", -1)
+        all_orders = await all_orders_cursor.to_list(None)
+        
+        # Get recent orders (last 10)
+        recent_orders_cursor = db.orders.find({"customer_id": customer_id}).sort("created_at", -1).limit(10)
+        recent_orders_list = await recent_orders_cursor.to_list(10)
+        
+        # Calculate statistics
+        total_orders = len(all_orders)
+        total_spent = sum([order.get("final_amount", order.get("total_amount", 0)) for order in all_orders])
+        average_order_value = total_spent / total_orders if total_orders > 0 else 0
+        
+        # Format recent orders
+        formatted_recent_orders = [
+            {
+                "order_id": order.get("order_id"),
+                "created_at": order.get("created_at"),
+                "final_amount": order.get("final_amount", order.get("total_amount", 0)),
+                "status": order.get("status", "pending")
+            }
+            for order in recent_orders_list
+        ]
+        
+        logger.info(f"Customer history fetched: {customer_id}, Orders: {total_orders}, Spent: {total_spent}")
+        
+        return {
+            "customer": {
+                "customer_id": customer.get("customer_id"),
+                "name": customer.get("name"),
+                "phone": customer.get("phone"),
+                "email": customer.get("email")
+            },
+            "statistics": {
+                "total_orders": total_orders,
+                "total_spent": round(total_spent, 2),
+                "average_order_value": round(average_order_value, 2)
+            },
+            "recent_orders": formatted_recent_orders
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching customer history: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error fetching customer history: {str(e)}")
+
+
+@api_router.put("/customers/{customer_id}", response_model=Customer)
+async def update_customer(customer_id: str, customer_update: CustomerUpdate):
+    """Update customer details"""
+    try:
+        update_data = {k: v for k, v in customer_update.dict().items() if v is not None}
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+        
+        update_data["updated_at"] = datetime.now(timezone.utc)
+        update_data = prepare_for_mongo(update_data)
+        
+        result = await db.customers.update_one(
+            {"customer_id": customer_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        
+        updated_customer = await db.customers.find_one({"customer_id": customer_id})
+        return Customer.parse_obj(updated_customer)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating customer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/customers", response_model=List[Customer])
+async def get_all_customers(skip: int = 0, limit: int = 50, active_only: bool = True):
+    """Get all customers"""
+    try:
+        query = {"status": "active"} if active_only else {}
+        customers_cursor = db.customers.find(query).skip(skip).limit(limit)
+        customers = []
+        async for customer in customers_cursor:
+            customers.append(Customer.parse_obj(customer))
+        return customers
+    except Exception as e:
+        logger.error(f"Error getting customers: {e}")
+        return []
+
+
 
 # ==================== REPORT ENDPOINTS ====================
 @api_router.get("/report")
@@ -1495,7 +1979,7 @@ async def list_printers():
         return {"error": str(e), "printers": []}
 # ==================== DIRECT PRINT ENDPOINT ====================
 @api_router.get("/health")
-async def health_check():
+async def api_health_check():
     return {"status": "ok", "message": "API is running"}
         
 @api_router.get("/health")
@@ -1604,11 +2088,20 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 @app.get("/{full_path:path}")
 async def serve_react_app(full_path: str):
     """Serve React app for all non-API, non-static routes"""
-    # Serve index.html for all other routes (React Router handles them)
-    index_file = APP_DIR / "frontend" / "build" / "index.html"
+    # ✅ DON'T serve React for API paths!
+    if full_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail=f"API route not found: {full_path}")
+    
+    # ✅ DON'T serve React for static files!
+    if full_path.startswith("static/"):
+        raise HTTPException(status_code=404, detail="Static file not found")
+    
+    # Only serve React for actual front-end routes
+    index_file = Path(APP_DIR) / "frontend" / "build" / "index.html"
     if index_file.exists():
         return FileResponse(str(index_file))
     raise HTTPException(status_code=404, detail="React build not found")
+
 
 
 # Mount React HTML at root (ABSOLUTELY LAST!)
@@ -1630,6 +2123,241 @@ def start_server():
         log_level="error",
         access_log=False
     )
+# ==================== CUSTOMER ENDPOINTS ====================
+# ==================== CUSTOMER ENDPOINTS ====================
+
+@api_router.post("/customers", response_model=Customer)
+async def create_customer(customer: CustomerCreate):
+    """Create a new customer"""
+    try:
+        # Check if phone already exists
+        existing = await db.customers.find_one({"phone": customer.phone})
+        if existing:
+            raise HTTPException(
+                status_code=400,
+                detail="Customer with this phone number already exists"
+            )
+        
+        customer_dict = customer.dict()
+        customer_dict["id"] = str(uuid.uuid4())
+        customer_dict["customer_id"] = f"CUST-{str(uuid.uuid4())[:8]}"
+        customer_dict["created_at"] = datetime.now(timezone.utc)
+        customer_dict["updated_at"] = datetime.now(timezone.utc)
+        customer_dict["order_history"] = {
+            "total_orders": 0,
+            "total_spent": 0.0,
+            "average_order_value": 0.0,
+            "last_order_date": None,
+            "favorite_items": []
+        }
+        customer_dict["loyalty_points"] = 0
+        customer_dict["status"] = "active"
+        
+        # Convert datetime objects for MongoDB
+        customer_dict = prepare_for_mongo(customer_dict)
+        
+        # Insert into database
+        result = await db.customers.insert_one(customer_dict)
+        
+        # Fetch the created customer
+        created_customer = await db.customers.find_one({"_id": result.inserted_id})
+        
+        # Parse and return
+        return Customer(**parse_from_mongo(created_customer))
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error creating customer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/customers/search", response_model=List[Customer])
+async def search_customers(query: str):
+    """Search customers by name or phone"""
+    try:
+        if not query or len(query) < 2:
+            return []
+        
+        import re
+        regex_pattern = re.compile(query, re.IGNORECASE)
+        
+        customers_cursor = db.customers.find({
+            "$or": [
+                {"name": {"$regex": regex_pattern}},
+                {"phone": {"$regex": query}},
+                {"email": {"$regex": regex_pattern}}
+            ],
+            "status": "active"
+        }).limit(10)
+        
+        customers = []
+        async for customer in customers_cursor:
+            customers.append(Customer(**parse_from_mongo(customer)))
+        
+        return customers
+    
+    except Exception as e:
+        print(f"Error searching customers: {e}")
+        return []
+
+
+@api_router.get("/customers/{customer_id}", response_model=Customer)
+async def get_customer(customer_id: str):
+    """Get customer by ID"""
+    try:
+        customer = await db.customers.find_one({"customer_id": customer_id})
+        if not customer:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        return Customer(**parse_from_mongo(customer))
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error getting customer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+
+
+
+@api_router.put("/customers/{customer_id}", response_model=Customer)
+async def update_customer(customer_id: str, customer_update: CustomerUpdate):
+    """Update customer details"""
+    try:
+        update_data = {k: v for k, v in customer_update.dict().items() if v is not None}
+        
+        if not update_data:
+            raise HTTPException(status_code=400, detail="No fields to update")
+        
+        update_data["updated_at"] = datetime.now(timezone.utc)
+        update_data = prepare_for_mongo(update_data)
+        
+        result = await db.customers.update_one(
+            {"customer_id": customer_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Customer not found")
+        
+        updated_customer = await db.customers.find_one({"customer_id": customer_id})
+        return Customer(**parse_from_mongo(updated_customer))
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating customer: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.get("/customers", response_model=List[Customer])
+async def get_all_customers(skip: int = 0, limit: int = 50, active_only: bool = True):
+    """Get all customers"""
+    try:
+        query = {"status": "active"} if active_only else {}
+        customers_cursor = db.customers.find(query).skip(skip).limit(limit)
+        customers = []
+        async for customer in customers_cursor:
+            customers.append(Customer(**parse_from_mongo(customer)))
+        return customers
+    
+    except Exception as e:
+        print(f"Error getting customers: {e}")
+        return []
+
+
+# ==================== UPDATE ORDER CREATION ====================
+# Modify your existing create_order endpoint to handle new fields:
+# Find your @api_router.post("/orders") endpoint and update it to:
+
+@api_router.post("/orders-enhanced", response_model=Order)
+async def create_order_enhanced(order_data: OrderCreate):
+    """Enhanced order creation with customer and discount support"""
+    # Calculate subtotal
+    total_amount = sum(i.quantity * i.price for i in order_data.items)
+    
+    # Calculate discount
+    discount_amount = 0.0
+    discount_obj = None
+    
+    if hasattr(order_data, 'discount') and order_data.discount:
+        if order_data.discount.type == "percentage":
+            discount_amount = (total_amount * order_data.discount.value) / 100
+        elif order_data.discount.type == "fixed":
+            discount_amount = order_data.discount.value
+        
+        discount_amount = min(discount_amount, total_amount)
+        
+        discount_obj = {
+            "type": order_data.discount.type,
+            "value": order_data.discount.value,
+            "reason": order_data.discount.reason or "",
+            "amount": discount_amount
+        }
+    
+    # Calculate GST on (subtotal - discount)
+    taxable_amount = total_amount - discount_amount
+    gst_amount = 0.0
+    final_amount = taxable_amount
+    
+    if order_data.gst_applicable:
+        gst_amount = round(taxable_amount * 0.05, 2)
+        final_amount = round(taxable_amount + gst_amount, 2)
+    
+    # Create order
+    now_ist = datetime.now(IST)
+    order_dict = order_data.dict()
+    order_dict["id"] = str(uuid.uuid4())
+    order_dict["order_id"] = generate_order_id()
+    order_dict["total_amount"] = round(total_amount, 2)
+    order_dict["discount"] = discount_obj
+    order_dict["gst_amount"] = gst_amount
+    order_dict["final_amount"] = final_amount
+    order_dict["status"] = OrderStatus.PENDING.value
+    order_dict["payment_status"] = PaymentStatus.PENDING.value
+    order_dict["created_at"] = now_ist
+    order_dict["updated_at"] = now_ist
+    order_dict["estimated_completion"] = now_ist + timedelta(minutes=30)
+    order_dict["kot_generated"] = False
+    
+    order_dict = prepare_for_mongo(order_dict)
+    await db.orders.insert_one(order_dict)
+    
+    # Update customer order history if customer_id provided
+    if order_dict.get("customer_id"):
+        await update_customer_order_history(order_dict["customer_id"], final_amount)
+    
+    # Update table status if table_number provided
+    if order_dict.get("table_number"):
+        await db.tables.update_one(
+            {"table_number": order_dict["table_number"]},
+            {"$set": {"status": "occupied", "current_order_id": order_dict["id"]}}
+        )
+    
+    return Order(**parse_from_mongo(order_dict))
+
+async def update_customer_order_history(customer_id: str, order_total: float):
+    """Update customer's order history"""
+    customer = await db.customers.find_one({"customer_id": customer_id})
+    if customer:
+        order_history = customer.get("order_history", {})
+        total_orders = order_history.get("total_orders", 0) + 1
+        total_spent = order_history.get("total_spent", 0.0) + order_total
+        avg_order_value = total_spent / total_orders
+        
+        await db.customers.update_one(
+            {"customer_id": customer_id},
+            {
+                "$set": {
+                    "order_history.total_orders": total_orders,
+                    "order_history.total_spent": round(total_spent, 2),
+                    "order_history.average_order_value": round(avg_order_value, 2),
+                    "order_history.last_order_date": datetime.now(timezone.utc),
+                    "loyalty_points": customer.get("loyalty_points", 0) + int(order_total / 10),
+                    "updated_at": datetime.now(timezone.utc)
+                }
+            }
+        )
 
 
 # ==================== LOGIN/SIGNUP WINDOW (FILE-BASED USER CHECK) ====================
@@ -1639,206 +2367,164 @@ if __name__ == "__main__":
     import time
     import webbrowser
     import socket
-    
-        # ==================== LICENSE CHECK ====================
+
     print("\n" + "="*70)
-    print(" "*20 + "TASTE PARADISE")
-    print(" "*15 + "Restaurant Management System")
+    print("                    TASTE PARADISE")
+    print("               Restaurant Management System")
     print("="*70)
     
-    # CHECK LICENSE BEFORE STARTING
-    # ============================================
-# LICENSE VALIDATION (Handles revocation, expiry, etc.)
-# ============================================
-check_result = check_license()
-
-# Handle tuple return (is_valid, license_info, error_msg)
-if isinstance(check_result, tuple):
-    is_valid, license_info, error_msg = check_result
-else:
-    # Fallback for old format
-    is_valid = check_result
-    license_info = None
-    error_msg = "License validation failed"
-
-if not is_valid:
-    # ❌ LICENSE INVALID - EXIT APP
-    print("\n" + "="*70)
-    print("❌ LICENSE VALIDATION FAILED")
-    print("="*70)
-    print(f"\n⚠️  Reason: {error_msg}")
+    # ============================================================
+    # OFFLINE LICENSE CHECK
+    # ============================================================
+    if not verify_license():
+        print("\n" + "="*70)
+        print("❌ LICENSE VALIDATION FAILED")
+        print("="*70)
+        print("\n⚠️  Cannot start TasteParadise without a valid license.")
+        print("\n" + "-"*70)
+        print("📞 SUPPORT")
+        print("-"*70)
+        print("  📧 Email: gaurhariom60@gmail.com")
+        print("  📱 Phone: +91 82183 55207")
+        print("-"*70)
+        print("🛒 PURCHASE A LICENSE")
+        print("-"*70)
+        print("  • Basic: ₹15,000/year")
+        print("  • Pro: ₹30,000/year")
+        print("  • Enterprise: ₹75,000 (10 years)")
+        print("="*70)
+        input("\nPress Enter to exit...")
+        sys.exit(1)
     
-    # Show specific help based on error type
-    print("\n" + "-"*70)
-    if "revoked" in str(error_msg).lower():
-        print("🚫 Your license has been REVOKED")
-        print("-"*70)
-        print("  Possible reasons:")
-        print("  • License key was shared with others")
-        print("  • Payment issue or chargeback")
-        print("  • Terms of service violation")
-        print("\n  👉 Contact support to resolve this issue")
-    elif "expired" in str(error_msg).lower():
-        print("⏰ Your license has EXPIRED")
-        print("-"*70)
-        print("  👉 Renew your license to continue using TasteParadise")
-    elif "not found" in str(error_msg).lower():
-        print("🔍 License key NOT FOUND")
-        print("-"*70)
-        print("  • Check for typos in your license key")
-        print("  • Make sure you're using the correct key")
-    elif "machine" in str(error_msg).lower():
-        print("💻 License already activated on another computer")
-        print("-"*70)
-        print("  • One license = One computer only")
-        print("  • Contact support to transfer your license")
-    else:
-        print("⚠️  License validation failed")
-    
-    print("\n" + "-"*70)
-    print("📞 SUPPORT")
-    print("-"*70)
-    print("  📧 Email: [email protected]")
-    print("  📱 Phone: +91 XXXXX XXXXX")
-    print("  🌐 Web: https://yourwebsite.com/support")
-    
-    print("\n" + "-"*70)
-    print("🛒 PURCHASE A LICENSE")
-    print("-"*70)
-    print("  • Basic: ₹15,000/year")
-    print("  • Pro: ₹30,000/year")
-    print("  • Enterprise: ₹75,000 (10 years)")
-    print("  🌐 Buy now: https://yourwebsite.com/buy")
+    # License verified - continue startup
+    print("\n✅ License verified! Initializing TasteParadise...")
     print("="*70)
     
-    input("\nPress Enter to exit...")
-    sys.exit(1)  # ← IMPORTANT: Exit the app!
-
-# ✅ LICENSE VALID - Continue
-print("\n✅ LICENSE VALIDATED")
-print("\n✅ LICENSE VALIDATED")
-if license_info:
-    print(f"   👤 Licensed to: {license_info.get('customer', 'Unknown')}")
-    print(f"   📦 Plan: {license_info.get('plan', 'Unknown').upper()}")
-    print(f"   📅 Valid until: {license_info.get('expiry_date', 'Unknown')[:10]}")
-print()
-
-# Line 1494
-# ================================================================
-
-# Line 1496 (Add proper indentation for these lines ↓)
-# Parse command line arguments
-parser = argparse.ArgumentParser(description='Taste Paradise Restaurant Management')
-parser.add_argument('--mode', choices=['browser', 'app', 'both'], default='browser',
-                    help='Launch mode: browser (web only), app (desktop only), or both (default)')
-
-args = parser.parse_args()
-
-if not app_started:
-        app_started = True
+    # ============================================================
+    # START MONGODB
+    # ============================================================
+    if not start_mongodb():
+        print("\n❌ Failed to start MongoDB!")
+        print("TasteParadise cannot run without database.")
+        input("\nPress Enter to exit...")
+        sys.exit(1)
+    
+    print("✅ MongoDB started successfully")
+    
+    # ============================================================
+    # CONNECT TO MONGODB
+    # ============================================================
+    try:
+        print("⏳ Connecting to MongoDB...")
+        mongo_client = AsyncIOMotorClient("mongodb://127.0.0.1:27017/")
+        db = mongo_client["taste_paradise"]
+        
+        # Test connection
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(mongo_client.admin.command('ping'))
+        
+        print("✅ Connected to MongoDB")
+        
+        # Initialize payment routes with database
+        init_payment_routes(db)
+        
+    except Exception as e:
+        print(f"❌ MongoDB connection failed: {e}")
+        stop_mongodb()
+        input("\nPress Enter to exit...")
+        sys.exit(1)
+    
+    # ============================================================
+    # START FASTAPI SERVER
+    # ============================================================
+    def start_server():
+        """Start FastAPI server in background thread"""
+        uvicorn.run(
+            app,
+            host="127.0.0.1",
+            port=8002,
+            log_level="error"
+        )
+    
+    # Start server in background thread
+    server_thread = threading.Thread(target=start_server, daemon=True)
+    server_thread.start()
+    
+    print("✅ FastAPI server starting...")
+    time.sleep(2)  # Wait for server to start
+    
+    # ============================================================
+    # CHECK IF SERVER IS RUNNING
+    # ============================================================
+    def check_server():
+        """Check if server is responding"""
         try:
-            print("=" * 70)
-            print("TASTE PARADISE - RESTAURANT MANAGEMENT SYSTEM")
-            print("=" * 70)
-            
-            # Start MongoDB
-            start_mongodb()
-            
-            # Get network IP
-            try:
-                network_ip = socket.gethostbyname(socket.gethostname())
-            except:
-                network_ip = "localhost"
-            
-            print(f"\n🚀 Launch Mode: {args.mode.upper()}")
-            print(f"🏠 Local:    http://localhost:8002")
-            print(f"🌐 Network: http://{network_ip}:8002")
-            print("=" * 70)
-            
-            # Start FastAPI server in background thread
-            def start_api_server():
-                uvicorn.run(app, host="0.0.0.0", port=8002, log_level="info")
-            
-            api_thread = threading.Thread(target=start_api_server, daemon=True)
-            api_thread.start()
-            
-            # Wait for server to start
-            time.sleep(3)
-            
-            # Open browser if requested
-            if args.mode in ['browser', 'both']:
-                print("\n🌐 Opening browser...")
-                webbrowser.open("http://localhost:8002")
-            
-            # Launch desktop app if requested
-                # Launch desktop app if requested
-                # Launch desktop app if requested
-            if args.mode in ['app', 'both']:
-                print("\n🖥️  Desktop mode requested...")
-        
-        # Try desktop mode, but fall back to browser if it fails
-                try:
-                    import webview
-                    print("   Launching desktop window...")
-                    window = webview.create_window(
-                        'Taste Paradise',
-                        'http://localhost:8002',
-                        width=1400,
-                        height=900,
-                        resizable=True,
-                        frameless=False
-                    )
-                    webview.start()
-                except Exception as e:
-                    print(f"\n⚠️  Desktop window failed: {e}")
-                    print("   Falling back to BROWSER MODE...")
-                    print("   (This is normal on some systems - browser mode works identically!)")
-            
-            # Force browser mode
-                    print("\n🌐 Opening browser instead...")
-                    webbrowser.open("http://localhost:8002")
-            
-            # Keep server running
-                    print("\n" + "="*70)
-                    print("✅ Application running in BROWSER MODE")
-                    print("="*70)
-                    print("\nPress CTRL+C to stop the server\n")
-            
-                    try:
-                        while True:
-                            time.sleep(1)
-                    except KeyboardInterrupt:
-                        print("\n\n🛑 Shutting down...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex(('127.0.0.1', 8002))
+            sock.close()
+            return result == 0
+        except:
+            return False
     
-            else:
-        # If browser-only mode, keep the server running
-                print("\n⚠️  Press CTRL+C to stop the server\n")
-                try:
-                    while True:
-                        time.sleep(1)
-                except KeyboardInterrupt:
-                    print("\n\n🛑 Shutting down...")
-     
-
+    max_retries = 10
+    for i in range(max_retries):
+        if check_server():
+            print("✅ Server is ready!")
+            break
+        print(f"⏳ Waiting for server... ({i+1}/{max_retries})")
+        time.sleep(1)
+    else:
+        print("❌ Server failed to start!")
+        stop_mongodb()
+        sys.exit(1)
+    
+    # ============================================================
+    # OPEN IN BROWSER (DEFAULT MODE)
+    # ============================================================
+    try:
+        url = "http://127.0.0.1:8002"
         
-                # If browser-only mode, keep the server running
-                print("\n⚠️  Press CTRL+C to stop the server\n")
-                try:
-                    while True:
-                        time.sleep(1)
-                except KeyboardInterrupt:
-                    print("\n\n🛑 Shutting down...")
+        # Open in default browser
+        print(f"\n🌐 Opening TasteParadise in browser...")
+        webbrowser.open(url)
         
+        print("\n" + "="*70)
+        print("✅ TASTEPARADISE IS RUNNING")
+        print("="*70)
+        print(f"   🌐 URL: {url}")
+        print(f"   📋 Access TasteParadise in your web browser")
+        print(f"   🔄 Refresh the page if it doesn't load")
+        print(f"\n   ⚠️  Press Ctrl+C to stop the server")
+        print("="*70)
+        
+        # Keep server alive
+        try:
+            while True:
+                time.sleep(1)
         except KeyboardInterrupt:
-            print("\n\n🛑 Shutting down gracefully...")
-        
-        except Exception as e:
-            print(f"❌ Error: {e}")
-            import traceback
-            traceback.print_exc()
-        
-        finally:
+            print("\n\n" + "="*70)
+            print("⚠️ SHUTTING DOWN TASTEPARADISE")
+            print("="*70)
+            print("⏳ Stopping MongoDB...")
             stop_mongodb()
+            print("✅ MongoDB stopped")
+            print("✅ Server stopped")
+            print("\n👋 Thank you for using TasteParadise!")
+            print("="*70)
+            sys.exit(0)
+    
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        print("\n⏳ Cleaning up...")
+        stop_mongodb()
+        input("\nPress Enter to exit...")
+        sys.exit(1)
+
 
 
 
