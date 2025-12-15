@@ -4,12 +4,14 @@ services:
     name: taste-paradise-frontend
     env: node
     plan: free
-    buildCommand: cd frontend && npm install && npm run build
-    startCommand: cd frontend && npm start
+    buildCommand: cd frontend && npm install && npm run build && npm install -g http-server
+    startCommand: cd frontend && http-server -p 3000 -c-1 dist
+    envVars:
       - key: REACT_APP_API_URL
         value: https://taste-paradise-backend.onrender.com
       - key: NODE_ENV
         value: production
+
   # Backend Service - FastAPI
   - type: web
     name: taste-paradise-backend
