@@ -2,6 +2,7 @@
 app_started = False
 
 # ==================== LICENSE SYSTEM ====================
+from email.mime import message
 from license_validator import OfflineLicenseValidator
 # ========================================================
 
@@ -70,6 +71,8 @@ logger = logging.getLogger(__name__)
 import os, sys, subprocess, time, threading, webview
 import platform
 import asyncio
+from pydantic import BaseModel, Field, validator
+from typing import Optional, List, Union
 from pathlib import Path
 from fastapi import FastAPI, APIRouter, HTTPException, Form , Body, WebSocket, WebSocketDisconnect
 from passlib.context import CryptContext
@@ -82,6 +85,7 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 import uuid
 from routes import payments
+from routes import inventory
 from fastapi import UploadFile, File
 from fastapi.responses import Response
 import pandas as pd
@@ -93,9 +97,63 @@ import uvicorn
 import secrets
 from datetime import datetime, timedelta
 import pytz 
+from chatbot_service import ChatbotNLPService
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from routes.payment_routes import router as payment_router, init_payment_routes
+#Fix ObjectId serialization
+from bson import ObjectId
+from datetime import datetime
+import httpx
 
+
+def mongo_to_dict(doc):
+    """
+    CENTRALIZED MongoDB to JSON converter
+    Handles: ObjectId, datetime, nested dicts, lists
+    This is the SINGLE source of truth for serialization
+    """
+    if doc is None:
+        return None
+    
+    if isinstance(doc, list):
+        return [mongo_to_dict(item) for item in doc]
+    
+    if isinstance(doc, dict):
+        result = {}
+        for key, value in doc.items():
+            if key == "_id":
+                result["id"] = str(value) if isinstance(value, ObjectId) else value
+            else:
+                result[key] = mongo_to_dict(value)
+        return result
+    
+    if isinstance(doc, ObjectId):
+        return str(doc)
+    
+    if isinstance(doc, datetime):
+        # ✅ FIX: Ensure datetime is in IST before converting to string
+        if doc.tzinfo is None:
+            # If no timezone, assume it's IST
+            doc = doc.replace(tzinfo=IST)
+        else:
+            # Convert to IST if it's in different timezone
+            doc = doc.astimezone(IST)
+        return doc.isoformat()
+    
+    return doc
+
+
+# ============================================================
+from pydantic import BaseModel
+
+# ✅ Pydantic V2 way to handle ObjectId serialization
+BaseModel.model_config = {"arbitrary_types_allowed": True}
+
+# Add custom JSON encoder for ObjectId globally
+def custom_json_encoder(obj):
+    if isinstance(obj, ObjectId):
+        return str(obj)
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
 
@@ -190,20 +248,53 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify password against hash"""
     return pwd_context.verify(plain_password, hashed_password)
 
-class OrderItem(BaseModel):
-    menu_item_id: str
-    menu_item_name: str
-    quantity: int
-    price: float
-    special_instructions: str = ""
-    food_type: str = "veg"  
-    is_custom_item: bool = False
-    category: Optional[str] = "" 
-    description: Optional[str] = ""
-    taxable: bool = True  
-    added_by: Optional[str] = ""
-    added_at: Optional[datetime] = None
+# ==================== INGREDIENT ITEM MODEL ====================
+class IngredientItem(BaseModel):
+    """Individual ingredient in a recipe"""
+    ingredient_id: Optional[str] = None  # Reference to inventory item
+    ingredient_name: str  # Name of ingredient (e.g., "Butter")
+    quantity: float  # Amount needed
+    unit: str  # kg, ltr, pieces, gm, ml, etc
+    cost_per_unit: Optional[float] = 0
+    
+    class Config:
+        extra = "ignore"
 
+class OrderItem(BaseModel):
+    menuitemid: Optional[str] = ''
+    menuitemname: Optional[str] = ''
+    price: float = 0
+    quantity: int = 1
+    foodtype: Optional[str] = 'veg'
+    category: Optional[str] = ''
+    specialinstructions: Optional[str] = ''
+    iscustomitem: Optional[bool] = False
+    addedby: Optional[str] = 'System'
+    addedat: Optional[Union[str, datetime]] = None
+        # 🔑 NEW FIELDS: Track ingredients
+    ingredients: Optional[List[IngredientItem]] = Field(default_factory=list)
+    ingredients_deducted: bool = False  # Track if inventory deducted
+    
+    @validator('menuitemid', 'menuitemname', pre=True, always=True)
+    def ensure_string(cls, v):
+        if v is None or v == '':
+            return ''
+        return str(v)
+    
+    @validator('addedat', pre=True, always=True)
+    def ensure_datetime_format(cls, v):
+        if v is None:
+            return datetime.now(IST).isoformat()
+        if isinstance(v, datetime):
+            return v.isoformat()
+        return str(v)
+    
+    class Config:
+        extra = 'ignore'
+
+
+
+# ==================== UPDATED MENU ITEM MODEL WITH INGREDIENTS ====================
 class MenuItem(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
@@ -214,7 +305,54 @@ class MenuItem(BaseModel):
     image_url: Optional[str] = None
     is_available: bool = True
     preparation_time: int = 15
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    # 🔑 NEW FIELD: Ingredients list
+    ingredients: List[IngredientItem] = Field(default_factory=list)
+    
+    created_at: datetime = Field(default_factory=lambda: datetime.now(IST))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(IST))
+    
+    class Config:
+        extra = "ignore"
+
+# ==================== INVENTORY ITEM MODEL ====================
+class InventoryItem(BaseModel):
+    """Inventory/Stock item (Butter, Oil, Tomatoes, etc)"""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    name: str  # e.g., "Butter"
+    category: str  # Vegetables, Spices, Oil, Dairy, Meat, Dry Goods, Beverages
+    unit: str  # kg, ltr, pieces, gm, ml, dozen, box
+    current_stock: float  # Current quantity in stock
+    reorder_level: float  # Alert when stock falls below this
+    unit_cost: float  # Cost per unit
+    supplier: Optional[str] = None
+    supplier_contact: Optional[str] = None
+    status: str = "active"
+    last_updated: datetime = Field(default_factory=lambda: datetime.now(IST))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(IST))
+    
+    class Config:
+        extra = "ignore"
+
+
+# ==================== STOCK TRANSACTION MODEL ====================
+class StockTransaction(BaseModel):
+    """Log of all stock movements"""
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    item_id: str  # Reference to inventory item
+    item_name: str  # Cached item name
+    transaction_type: str  # purchase, usage, waste, adjustment, order_deduction
+    quantity: float  # Amount added/removed
+    notes: Optional[str] = None
+    previous_stock: float
+    new_stock: float
+    order_id: Optional[str] = None
+    transaction_date: datetime = Field(default_factory=lambda: datetime.now(IST))
+    created_by: str = "system"
+    
+    class Config:
+        extra = "ignore"
+
 
 class MenuItemCreate(BaseModel):
     name: str
@@ -269,8 +407,8 @@ class Customer(BaseModel):
     order_history: OrderHistory = OrderHistory()
     loyalty_points: int = 0
     status: str = "active"  # active, inactive
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(IST))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(IST))
 
 # ==================== NEW DISCOUNT MODEL ====================
 class Discount(BaseModel):
@@ -297,10 +435,22 @@ class Order(BaseModel):
     status: OrderStatus = OrderStatus.PENDING
     payment_status: PaymentStatus = PaymentStatus.PENDING
     payment_method: Optional[PaymentMethod] = None
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(IST))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(IST))
     estimated_completion: Optional[datetime] = None
     kot_generated: bool = False
+
+    @validator('table_number', pre=True, always=True)
+    def convert_table_number(cls, v):
+        if isinstance(v, int):
+            return str(v)
+        if v is None:
+            return '0'
+        return str(v)
+    
+    class Config:
+        extra = 'ignore'
+
 
 class OrderCreate(BaseModel):
     order_type: str = "dine-in"
@@ -335,8 +485,19 @@ class KOT(BaseModel):
     order_number: str
     table_number: Optional[str] = None
     items: List[OrderItem]
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(IST))
     status: OrderStatus = OrderStatus.PENDING
+
+    @validator('table_number', pre=True, always=True)
+    def convert_table_number(cls, v):
+        if isinstance(v, int):
+            return str(v)
+        if v is None:
+            return '0'
+        return str(v)
+    
+    class Config:
+        extra = 'ignore'
 
 class DashboardStats(BaseModel):
     today_orders: int
@@ -356,7 +517,7 @@ class RestaurantTable(BaseModel):
     current_order_id: Optional[str] = None
     position_x: int = 0
     position_y: int = 0
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(IST))
 
 class TableCreate(BaseModel):
     table_number: str
@@ -379,8 +540,8 @@ class DailyReport(BaseModel):
     orders_list: List[Order] = []
     kots_list: List[KOT] = []
     bills_list: List[Order] = []
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(IST))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(IST))
     # ✨ NEW: Admin model for authentication
 class Admin(BaseModel):
     admin_id: str = Field(..., min_length=3)
@@ -394,24 +555,50 @@ class Admin(BaseModel):
 
 # ==================== HELPER FUNCTIONS ====================
 def prepare_for_mongo(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert Pydantic models to MongoDB format.
+    IMPORTANT: Keep datetime objects as datetime for proper MongoDB sorting!
+    """
     for k, v in data.items():
         if isinstance(v, datetime):
-            data[k] = v.isoformat()
+            # ✅ KEEP as datetime object, DON'T convert to string!
+            if v.tzinfo is None:
+                v = v.replace(tzinfo=IST)
+            data[k] = v  # ✅ Store as datetime, not ISO string
         elif isinstance(v, list):
             data[k] = [prepare_for_mongo(i) if isinstance(i, dict) else i for i in v]
     return data
 
+
 def parse_from_mongo(data: Dict[str, Any]) -> Dict[str, Any]:
-    if '_id' in data:
-        del data['_id']
+    """Parse MongoDB document for Pydantic models."""
+    from bson import ObjectId
+    
+    if "_id" in data:
+        if "id" not in data:
+            data["id"] = str(data["_id"]) if isinstance(data["_id"], ObjectId) else data["_id"]
+            del data["_id"]
+    
     for k, v in data.items():
-        if isinstance(v, str) and k.endswith(('_at', 'completion')):
+        if isinstance(v, datetime):
+            # ✅ FIX: Convert to IST before converting to ISO string
+            if v.tzinfo is None:
+                v = v.replace(tzinfo=IST)
+            else:
+                v = v.astimezone(IST)
+            data[k] = v.isoformat()
+        elif isinstance(v, str) and k.endswith(("at", "completion")):
             try:
-                data[k] = datetime.fromisoformat(v.replace('Z', '+00:00'))
-            except Exception:
-                pass
+                dt = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                # ✅ FIX: Convert to IST
+                dt = dt.astimezone(IST)
+                data[k] = dt.isoformat()
+            except:
+                data[k] = v
         elif isinstance(v, list):
             data[k] = [parse_from_mongo(i) if isinstance(i, dict) else i for i in v]
+        elif isinstance(v, dict):
+            data[k] = parse_from_mongo(v)
+    
     return data
 
 
@@ -646,6 +833,504 @@ class NoCacheMiddleware(BaseHTTPMiddleware):
 
 # ==================== FASTAPI APP ====================
 app = FastAPI(title="Taste Paradise API", version="1.0.0")
+# ============ FULL FUNCTIONAL CHATBOT ENDPOINT ============
+from pydantic import BaseModel
+from typing import Optional, List, Dict as DictType
+import uuid
+from datetime import datetime, timezone
+
+# Store database reference globally
+chatbot_db = None
+
+class ChatMessage(BaseModel):
+    message: str
+    session_id: str
+    table_number: Optional[str] = None
+    customer_name: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    intent: str
+    items: Optional[List[DictType]] = None
+    order_id: Optional[str] = None
+    order_summary: Optional[DictType] = None
+    action: Optional[str] = None
+
+# Session storage for ongoing orders
+chatbot_sessions = {}
+
+def get_session(session_id: str) -> Dict:
+    """Get or create a session"""
+    if session_id not in chatbot_sessions:
+        chatbot_sessions[session_id] = {
+            'items': [],
+            'table_number': None,
+            'customer_name': 'Walk-in',
+            'created_at': datetime.now(IST)
+        }
+    return chatbot_sessions[session_id]
+
+        # ===== Fetch menu items =====
+async def fetch_menu_items():
+            """Fetch all menu items from database"""
+            try:
+                if chatbot_db is None:
+                    logger.error("chatbot_db is None")
+                    return []
+                
+                menu_items = []
+                async for item in chatbot_db.menu_items.find({}):
+                    menu_items.append({
+                        'name': item.get('name', ''),
+                        'price': float(item.get('price', 0)) if item.get('price') else 0,
+                        'id': item.get('id') or str(item.get('_id', uuid.uuid4()))
+                    })
+                
+                logger.info(f"✅ Fetched {len(menu_items)} menu items")
+                return menu_items
+                
+            except Exception as e:
+                logger.error(f"Error fetching menu: {e}")
+                import traceback
+                traceback.print_exc()
+                return []
+
+
+
+
+
+
+async def create_order(session: Dict) -> Dict:
+    """Create order and KOT"""
+    try:
+        if chatbot_db is None:
+            logger.error("chatbot_db is None - cannot create order")
+            return None
+        
+        db = chatbot_db
+        
+        # Build order items with proper field mapping
+        matched_items = []
+        for item in session['items']:
+            # Chatbot stores 'name' and 'price', map them correctly
+            item_dict = {
+                'menuitemid': item.get('menuitemid') or item.get('id', str(uuid.uuid4())),
+                'menuitemname': item.get('menuitemname') or item.get('name', 'Unknown'),
+                'price': float(item.get('price', 0)) if item.get('price') else 0.0,
+                'quantity': int(item.get('quantity', 1)),
+                'specialinstructions': item.get('specialinstructions', ''),
+                'foodtype': item.get('foodtype', 'veg'),
+                'category': item.get('category', ''),
+                'iscustomitem': False,
+                'addedby': 'Chatbot',
+                'addedat': datetime.now(IST)
+            }
+            matched_items.append(item_dict)
+        
+        # Calculate totals - FIXED: Explicitly convert to float and use proper iteration
+        subtotal = 0.0
+        for item in matched_items:
+            subtotal += float(item['quantity']) * float(item['price'])
+        
+        gst = round(subtotal * 0.05, 2)
+        total = round(subtotal + gst, 2)
+        
+        order_id = str(uuid.uuid4())
+        order_number = f"ORD-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
+        order_data = {
+            'id': order_id,
+            'order_id': order_number,
+            '_id': order_id,
+            'customer_name': session.get('customer_name', 'Walk-in'),
+            'table_number': session.get('table_number', 0),
+            'items': matched_items,
+            'total_amount': subtotal,
+            'gst_amount': gst,
+            'final_amount': total,
+            'gst_applicable': True,
+            'status': 'pending',
+            'payment_status': 'pending',
+            'kot_generated': False,
+            'created_at': datetime.now(IST),
+            'updated_at': datetime.now(IST)
+        }
+        
+        await db.orders.insert_one(order_data)
+        
+        # Generate KOT
+        kot_count = await db.kots.count_documents({})
+        kot_number = f"KOT-{kot_count + 1:04d}"
+        
+        kot_data = {
+            'id': kot_number,
+            'order_id': order_number,
+            'order_number': kot_number,
+            'table_number': session.get('table_number', 0),
+            'items': matched_items,
+            'status': 'pending',
+            'created_at': datetime.now(IST)
+        }
+        
+        await db.kots.insert_one(kot_data)
+        await db.orders.update_one({'id': order_id}, {'$set': {'kot_generated': True}})
+        
+        logger.info(f"✅ Order created: {order_number}, KOT: {kot_number}")
+        
+        return {
+            'order_id': order_id,
+            'order_number': order_number,
+            'kot_number': kot_number,
+            'total': total
+        }
+        
+    except Exception as e:
+        logger.error(f"Error creating order: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+
+# Replace your entire chatbot endpoint (lines 813-990) with this:
+
+@app.post("/api/chatbot/message")
+async def chatbot_message_endpoint(chat: ChatMessage):
+    """Process chatbot message"""
+    logger.info(f"📩 Chatbot: '{chat.message}' from {chat.session_id}")
+    
+    try:
+        # Initialize or get session
+        if chat.session_id not in chatbot_sessions:
+            chatbot_sessions[chat.session_id] = {
+                'items': [],
+                'customer_name': chat.customer_name or 'Walk-in',
+                'table_number': chat.table_number or 0,
+                'created_at': datetime.now(IST)
+            }
+        
+        session = chatbot_sessions[chat.session_id]
+        message = chat.message.lower().strip()
+        
+        # ===== Fetch menu items =====
+        async def fetch_menu_items():
+            """Fetch all menu items from database"""
+            try:
+                if chatbot_db is None:
+                    logger.error("chatbot_db is None")
+                    return []
+                
+                menu_items = []
+                cursor = chatbot_db.menu_items.find({})
+                async for item in cursor:
+                    menu_items.append({
+                        'name': item.get('name', ''),
+                        'price': float(item.get('price', 0)) if item.get('price') else 0,
+                        'id': str(item.get('_id', '')),
+                        'category': item.get('category', 'General'),
+                        'foodtype': item.get('foodtype', 'veg')
+                    })
+                
+                logger.info(f"✅ Fetched {len(menu_items)} menu items")
+                return menu_items
+                
+            except Exception as e:
+                logger.error(f"Error fetching menu: {e}")
+                import traceback
+                traceback.print_exc()
+                return []
+        
+        # ===== INTENT: Show Menu =====
+        if any(word in message for word in ['menu', 'show', 'list', 'what', 'available']):
+            menu_items = await fetch_menu_items()
+            if not menu_items:
+                return ChatResponse(
+                    response="Sorry, the menu is not available right now. Please try again in a moment!",
+                    intent="error"
+                )
+            
+            # Group by category
+            categories = {}
+            for item in menu_items:
+                cat = item.get('category', 'General')
+                if cat not in categories:
+                    categories[cat] = []
+                categories[cat].append(item)
+            
+            # Build menu text
+            menu_text = "📋 **Our Menu:**\n\n"
+            for category, items in categories.items():
+                menu_text += f"**{category}:**\n"
+                for item in items:
+                    emoji = "🌱" if item.get('foodtype') == 'veg' else "🍖"
+                    menu_text += f"  {emoji} {item['name']}  - ₹{item['price']:.1f}\n"
+                menu_text += "\n"
+            
+            menu_text += "💬 Type what you'd like to order!\nExample: 'I want 2 butter chicken' or 'add paneer tikka'"
+            
+            return ChatResponse(
+                response=menu_text,
+                intent="show_menu",
+                items=menu_items
+            )
+        
+        # ===== INTENT: Add Items (Natural Language) =====
+        elif any(word in message for word in ['want', 'order', 'add', 'get', 'give', 'need', 'can i have', 'like', 'i\'ll have']):
+            menu_items = await fetch_menu_items()
+            if not menu_items:
+                return ChatResponse(
+                    response="Sorry, couldn't load the menu to process your order.",
+                    intent="error"
+                )
+            
+            matched_items = []
+            
+            # Extract quantity from message
+            quantity = 1
+            for word in message.split():
+                if word.isdigit():
+                    quantity = int(word)
+                    break
+            
+            # Improved item matching - case insensitive partial match
+            search_words = [w.lower() for w in message.split() if len(w) > 2 and not w.isdigit()]
+            
+            for item in menu_items:
+                item_name_lower = item.get('name', '').lower()
+                
+                # Check if any significant word from message matches item name
+                if any(search_word in item_name_lower for search_word in search_words):
+                    matched_item = {
+                        'menuitemid': item['id'],
+                        'menuitemname': item['name'],
+                        'price': item['price'],
+                        'quantity': quantity,
+                        'foodtype': item.get('foodtype', 'veg'),
+                        'category': item.get('category', '')
+                    }
+                    matched_items.append(matched_item)
+                    break
+            
+            if matched_items:
+                # Add to session
+                session['items'].extend(matched_items)
+                
+                total = sum(item['quantity'] * item['price'] for item in session['items'])
+                gst = total * 0.05
+                final_total = total + gst
+                
+                # Build items text
+                items_text = "\n".join([
+                    f"• {item['quantity']}x {item['menuitemname']} - ₹{item['price'] * item['quantity']:.2f}"
+                    for item in matched_items
+                ])
+                
+                return ChatResponse(
+                    response=f"✅ **Added to your order:**\n{items_text}\n\n💰 **Current Total: ₹{total:.2f}**\n\n➕ Want to add more? Just tell me!\n✅ Say 'confirm' to place order\n❌ Say 'cancel' to start over",
+                    intent="add_items",
+                    items=matched_items,
+                    order_summary={
+                        'items': session['items'],
+                        'subtotal': total,
+                        'gst': gst,
+                        'total': final_total
+                    }
+                )
+            else:
+                return ChatResponse(
+                    response=f"🤔 Sorry, couldn't find '{message}' in our menu.\n\n💬 Try 'show menu' to see all available items!",
+                    intent="item_not_found"
+                )
+        
+                # ===== INTENT: Confirm Order =====
+                # ===== INTENT: Confirm Order =====
+        elif any(word in message for word in ['confirm', 'done', 'finish', 'complete', 'place', 'submit', 'yes']):
+            if not session['items']:
+                return ChatResponse(
+                    response="🛒 Your cart is empty!\n\nTell me what you'd like to order. Example: 'I want 2 butter chicken'",
+                    intent="error"
+                )
+            
+            try:
+                # Build order using same format as manual order (Place Order button)
+                total = sum(item['quantity'] * item['price'] for item in session['items'])
+                gst_amount = round(total * 0.05, 2)
+                final_total = round(total + gst_amount, 2)
+                
+                # Generate order and KOT numbers
+                order_counter = await chatbot_db.orders.count_documents({}) + 1
+                order_number = f"ORD-{datetime.now().strftime('%Y%m%d')}-{order_counter:04d}"
+                
+                kot_counter = await chatbot_db.kots.count_documents({}) + 1
+                kot_number = f"KOT-{kot_counter:04d}"
+                
+                # FIX: Transform items to match expected format
+                fixed_items = []
+                for item in session['items']:
+                    fixed_items.append({
+                        'menuitemid': str(item.get('menuitemid', '')),
+                        'menuitemname': str(item.get('menuitemname', '')),
+                        'price': float(item.get('price', 0)),
+                        'quantity': int(item.get('quantity', 1)),
+                        'foodtype': item.get('foodtype', 'veg'),
+                        'category': item.get('category', ''),
+                        'specialinstructions': '',
+                        'iscustomitem': False,
+                        'addedby': 'Chatbot',
+                        'addedat': datetime.now(IST).isoformat()
+                    })
+                
+                # Create order directly in database
+                order_id = str(uuid.uuid4())
+                order_data = {
+                    'id': order_number,
+                    'order_id': order_number,
+                    'customer_name': session.get('customer_name', 'Walk-in'),
+                    'table_number': str(session.get('table_number', '0')),
+                    'items': fixed_items,
+                    'total_amount': total,
+                    'gst_amount': gst_amount,
+                    'final_amount': final_total,
+                    'gst_applicable': True,
+                    'status': 'pending',
+                    'payment_status': 'pending',
+                    'order_type': 'Dine-in',
+                    'kot_generated': False,
+                    'created_at': datetime.now(IST),
+                    'updated_at': datetime.now(IST)
+                }
+                
+                # Insert order into database
+                await chatbot_db.orders.insert_one(order_data)
+                
+                # Generate and insert KOT
+                kot_data = {
+                    'id': kot_number,
+                    'order_id': order_number,
+                    'order_number': kot_number,
+                    'table_number': str(session.get('table_number', '0')),
+                    'items': fixed_items,
+                    'status': 'pending',
+                    'created_at': datetime.now(IST)
+                }
+                
+                await chatbot_db.kots.insert_one(kot_data)
+                await chatbot_db.orders.update_one(
+                    {'id': order_number}, 
+                    {'$set': {'kot_generated': True}}
+                )
+                
+                # Clear session
+                chatbot_sessions.pop(chat.session_id, None)
+                
+                logger.info(f"✅ Chatbot order created: {order_number}, KOT: {kot_number}")
+                
+                return ChatResponse(
+                    response=f"✅ **Order Confirmed!**\n\n📋 Order: {order_number}\n🍽️ KOT: {kot_number}\n\n💰 Total: ₹{final_total:.2f}\n\nYour order has been sent to the kitchen! 🔥",
+                    intent="order_created",
+                    order_id=order_number,
+                    action="order_confirmed",
+                    order_summary={'total': final_total}
+                )
+                
+            except Exception as e:
+                logger.error(f"Order creation error: {e}")
+                import traceback
+                traceback.print_exc()
+                return ChatResponse(
+                    response="❌ Sorry, couldn't place the order. Please try again or contact staff.",
+                    intent="error"
+                )
+
+
+        
+        # ===== INTENT: Cancel Order =====
+        elif any(word in message for word in ['cancel', 'clear', 'remove', 'delete', 'start over', 'reset']):
+            chatbot_sessions.pop(chat.session_id, None)
+            return ChatResponse(
+                response="🗑️ **Order cancelled!**\n\nStarting fresh! What would you like to order?",
+                intent="cancel"
+            )
+        
+        # ===== INTENT: Show Current Cart =====
+        elif any(word in message for word in ['cart', 'current', 'summary', 'total', 'bill', 'my order']):
+            if session['items']:
+                total = sum(item['quantity'] * item['price'] for item in session['items'])
+                gst = total * 0.05
+                final_total = total + gst
+                
+                items_list = "\n".join([
+                    f"🍽️ {item['quantity']}x {item['menuitemname']} - ₹{item['price'] * item['quantity']:.2f}"
+                    for item in session['items']
+                ])
+                
+                return ChatResponse(
+                    response=f"🛒 **Your Current Order:**\n\n{items_list}\n\n💵 Subtotal: ₹{total:.2f}\n📊 GST (5%): ₹{gst:.2f}\n💰 **Total: ₹{final_total:.2f}**",
+                    intent="show_cart",
+                    order_summary={
+                        'items': session['items'],
+                        'subtotal': total,
+                        'gst': gst,
+                        'total': final_total
+                    }
+                )
+            else:
+                return ChatResponse(
+                    response="🛒 Your cart is empty!\n\n👋 Tell me what you'd like to order!",
+                    intent="empty_cart"
+                )
+        
+        # ===== Default: Help =====
+        else:
+            return ChatResponse(
+                response="👋 Hi! I'm your order assistant.\n\n**I can help you:**\n\n📋 **'See menu'** - View all items\n🛒 **'Add 2 paneer tikka'** - Place your order\n✅ **'Confirm'** - Complete order\n❌ **'Cancel'** - Start fresh",
+                intent="help"
+            )
+    
+    except Exception as e:
+        logger.error(f"❌ Chatbot error: {e}")
+        import traceback
+        traceback.print_exc()
+        return ChatResponse(
+            response="Sorry, I encountered an error. Please try again!",
+            intent="error"
+        )
+
+
+
+logger.info("✅ Full functional chatbot endpoint registered")
+# ============ END CHATBOT ENDPOINT ============
+
+import httpx
+
+class AIChatRequest(BaseModel):
+    message: str
+
+@app.post("/api/ai-chat")
+async def ai_chat_proxy(request: AIChatRequest):
+    """
+    Proxy to AI service for intelligent menu search
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "http://localhost:8003/chat",
+                json={"message": request.message},
+                timeout=30.0
+            )
+            return response.json()
+    except httpx.RequestError as e:
+        logger.error(f"AI Service connection error: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="AI service unavailable. Using fallback chatbot."
+        )
+    except Exception as e:
+        logger.error(f"AI chat error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+logger.info("✅ AI service proxy endpoint registered")
+
 from routes.kot_printer import routes as kot_routes
 
 api_router = APIRouter(prefix="/api")
@@ -666,18 +1351,30 @@ app.add_middleware(NoCacheMiddleware)
 
 app.include_router(payment_router)
 app.include_router(kot_routes)
+inventory.set_db(db)  # Pass database reference to inventory module
+app.include_router(inventory.router, prefix="/api")  # Fixed prefix
+
+
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "")
+
+# Build CORS origins list
+cors_origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8002",
+    "http://127.0.0.1:8002",
+    "http://127.0.0.1",
+    "http://localhost",
+]
+
+# Add Railway frontend URL if it exists
+if FRONTEND_URL:
+    cors_origins.append(FRONTEND_URL)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:8002",
-        "http://127.0.0.1:8002",
-        "http://127.0.0.1",
-        "http://localhost",
-        "*"
-    ],
+    allow_origins=cors_origins + ["*"],  # Keep * for Railway flexibility
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
@@ -727,9 +1424,47 @@ async def startup():
             await mongo_client.admin.command('ping')
             
             db = mongo_client.taste_paradise
+            try:
+                collections = await db.list_collection_names()
+                if "inventory_items" not in collections:
+                    await db.create_collection("inventory_items")
+                    logger.info("✅ Inventory items collection created")
+                if "menu_items" not in collections:
+                    await db.create_collection("menu_items")
+                    logger.info("✅ Menu items collection created")
+            except Exception as e:
+                logger.warning(f"Could not create collections: {e}")
+
+                        # Initialize inventory system
+            try:
+                inventory.set_db(db)
+                await inventory.initialize_collections()
+                logger.info("✅ Inventory system initialized")
+            except Exception as e:
+                logger.error(f"Inventory initialization failed: {e}")
+        
+
+    
+            # Set database reference (at same level as try)
+            global chatbot_db
+            chatbot_db = db
+            logger.info("✅ Chatbot database reference set")
             logger.info(f"Connected to database successfully (attempt {attempt + 1})")
             init_payment_routes(db)
             logger.info("Payment routes initialized successfully")
+            break  # Exit the retry loop
+
+        except Exception as e:  # This catches the outer MongoDB connection errors
+            if attempt == max_retries - 1:
+                logger.error(f"Failed to connect to MongoDB after {max_retries} attempts: {e}")
+                raise
+            else:
+                logger.warning(f"MongoDB connection attempt {attempt + 1} failed: {e}")
+                await asyncio.sleep(retry_delay)            
+            
+
+
+
 
      # ============================================================
             # 🌐 CLOUD SYNC SERVICE INITIALIZATION
@@ -802,7 +1537,7 @@ async def shutdown():
 async def daily_reset():
     try:
         logger.info("Running daily reset...")
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now(IST).date().isoformat()
         await db.daily_reports.delete_one({"date": today})
         logger.info(f"Daily reset completed for {today}")
     except Exception as e:
@@ -839,21 +1574,35 @@ async def update_menu_item(menu_item_id: str, item: MenuItemCreate = Body(...)):
 
 @api_router.get("/menu/template")
 async def download_template():
-    """Download Excel template for bulk menu import"""
+    """Download Excel template for bulk menu import WITH INGREDIENTS"""
     try:
-        # Create sample data
+        # Create sample data with ingredients column
         data = {
-            'name': ['Paneer Tikka', 'Butter Chicken', 'Dal Makhani', 'Naan', 'Gulab Jamun'],
+            'name': [
+                'Burger', 
+                'Paneer Tikka', 
+                'Butter Chicken', 
+                'Dal Makhani', 
+                'Naan'
+            ],
             'description': [
+                'Delicious chicken burger with veggies',
                 'Cottage cheese marinated in spices',
                 'Chicken in rich tomato gravy',
                 'Black lentils in creamy sauce',
-                'Indian flatbread',
-                'Sweet milk-solid dumplings'
+                'Indian flatbread'
             ],
-            'price': [250.00, 350.00, 180.00, 40.00, 80.00],
-            'category': ['Starters', 'Main Course', 'Main Course', 'Breads', 'Desserts'],
-            'preparationtime': [20, 30, 25, 10, 15]
+            'price': [120.00, 250.00, 350.00, 180.00, 40.00],
+            'category': ['Main Course', 'Starters', 'Main Course', 'Main Course', 'Breads'],
+            'food_type': ['non-veg', 'veg', 'non-veg', 'veg', 'veg'],  # ✅ NEW COLUMN
+            'preparationtime': [10, 20, 30, 25, 10],
+            'ingredients': [  # ✅ NEW COLUMN
+                'Bun(2 pieces),Tikki(1 piece),Tomato(50 gm),Onion(30 gm),Cheese(20 gm)',
+                'Paneer(200 gm),Oil(20 ml),Spices(10 gm)',
+                'Chicken(250 gm),Butter(50 gm),Cream(30 ml),Tomato(100 gm)',
+                'Dal(200 gm),Butter(30 gm),Cream(20 ml)',
+                ''  # No ingredients for Naan
+            ]
         }
         
         # Create DataFrame
@@ -865,7 +1614,19 @@ async def download_template():
         # Use openpyxl engine
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, sheet_name='Menu Items', index=False)
-        
+            
+            # Get the worksheet
+            worksheet = writer.sheets['Menu Items']
+            
+            # Set column widths for better readability
+            worksheet.column_dimensions['A'].width = 20  # name
+            worksheet.column_dimensions['B'].width = 40  # description
+            worksheet.column_dimensions['C'].width = 10  # price
+            worksheet.column_dimensions['D'].width = 15  # category
+            worksheet.column_dimensions['E'].width = 12  # food_type
+            worksheet.column_dimensions['F'].width = 15  # preparationtime
+            worksheet.column_dimensions['G'].width = 60  # ingredients (WIDE!)
+            
         output.seek(0)
         
         # Return as response
@@ -873,7 +1634,7 @@ async def download_template():
             content=output.read(),
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             headers={
-                'Content-Disposition': 'attachment; filename=menu_template.xlsx',
+                'Content-Disposition': 'attachment; filename=menu_template_with_ingredients.xlsx',
                 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
             }
         )
@@ -883,6 +1644,8 @@ async def download_template():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error creating template: {str(e)}")
+
+
 @api_router.post("/menu/import")
 async def import_menu(file: UploadFile = File(...)):
     """Import menu items from Excel file"""
@@ -936,7 +1699,7 @@ async def import_menu(file: UploadFile = File(...)):
                     "imageurl": str(row.get('imageurl', '')) if pd.notna(row.get('imageurl')) else None,
                     "isavailable": True,
                     "preparationtime": int(row.get('preparationtime', 15)),
-                    "createdat": datetime.now(timezone.utc)
+                    "createdat": datetime.now(IST)
                 }
                 
                 # Insert into database
@@ -980,68 +1743,491 @@ async def delete_menu_item(menu_item_id: str):
 # ==================== ORDER ENDPOINTS ====================
 @api_router.post("/orders", response_model=Order)
 async def create_order(order_data: OrderCreate):
-    # Calculate subtotal
-    total_amount = sum(i.quantity * i.price for i in order_data.items)
+    enriched_items = []
+    max_prep_time = 30
+    
+    for item in order_data.items:
+    # ✅ Get menuitemname with better fallback
+        item_name = getattr(item, 'menuitemname', None) or getattr(item, 'name', None) or "Unknown Item"
+    
+    # ✅ Add debug logging
+        logger.info(f"Processing item: ID={item.menuitemid}, Name={item_name}")
+    
+    # Try to find menu item for additional details
+        menu_item = await db.menu_items.find_one({"id": item.menuitemid})
+
+        
+        if menu_item:
+            max_prep_time = max(max_prep_time, menu_item.get('preparation_time', 15))
+            
+            enriched_item = OrderItem(
+                menuitemid=str(menu_item.get("id", item.menuitemid)),
+                menuitemname=item_name or menu_item.get("name", "Unknown Item"),
+                price=float(item.price),
+                quantity=int(item.quantity),
+                foodtype=menu_item.get("food_type", "veg"),
+                category=menu_item.get("category", ""),
+                specialinstructions=getattr(item, 'specialinstructions', "") or "",
+                iscustomitem=False,
+                addedby="POS",
+                addedat=datetime.now(IST)
+            )
+        else:
+            # Menu item not found - use frontend data
+            enriched_item = OrderItem(
+                menuitemid=item.menuitemid,
+                menuitemname=item_name or "Unknown Item",
+                price=float(item.price),
+                quantity=int(item.quantity),
+                specialinstructions=getattr(item, 'specialinstructions', "") or "",
+                iscustomitem=False,
+                addedby="POS",
+                addedat=datetime.now(IST)
+            )
+            logger.warning(f"Menu item not found for ID: {item.menuitemid}, using name: {item_name}")
+        
+        enriched_items.append(enriched_item)
+    
+    # Calculate totals using enriched items
+    total_amount = sum(i.quantity * i.price for i in enriched_items)
     
     # Calculate GST if applicable
     gst_amount = 0.0
     final_amount = total_amount
     
     if order_data.gst_applicable:
-        gst_amount = round(total_amount * 0.05, 2)  # 5% GST
+        gst_amount = round(total_amount * 0.05, 2)
         final_amount = round(total_amount + gst_amount, 2)
     
-    # Calculate preparation time
-    max_prep_time = 30
-    for i in order_data.items:
-        menu_item = await db.menu_items.find_one({"id": i.menu_item_id})
-        if menu_item:
-            max_prep_time = max(max_prep_time, menu_item.get('preparation_time', 15))
+    estimated_completion = datetime.now(IST).replace(microsecond=0) + timedelta(minutes=max_prep_time)
     
-    estimated_completion = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=max_prep_time)
-    
-    # Create order with GST fields
     # Get current time in IST
-    now_ist = datetime.now(IST)
-
+    now_utc = datetime.now(IST)
+    
+    # Create order with enriched items
     order = Order(
-        **order_data.model_dump(),
+        order_type=order_data.order_type,
+        customer_id=order_data.customer_id,
+        customer_name=order_data.customer_name,
+        phone=order_data.phone,
+        address=order_data.address,
+        table_number=order_data.table_number,
+        items=enriched_items,
+        discount=order_data.discount,
+        gst_applicable=order_data.gst_applicable,
         total_amount=total_amount,
         gst_amount=gst_amount,
         final_amount=final_amount,
         estimated_completion=estimated_completion,
-        created_at=now_ist,
-        updated_at=now_ist
+        created_at=now_utc,
+        updated_at=now_utc
     )
-
     
     order_dict = prepare_for_mongo(order.model_dump())
+    
     await db.orders.insert_one(order_dict)
-
+    
+    # ✅ AUTO-DEDUCT INVENTORY FOR ORDER
+    try:
+        logger.info(f"🔄 Attempting inventory deduction for order {order.order_id}")
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            deduction_payload = {
+                "order_id": order.order_id,
+                "items": [
+                    {
+                        "menuitemid": item.menuitemid,
+                        "menuitemname": item.menuitemname,
+                        "quantity": item.quantity
+                    }
+                    for item in enriched_items
+                ]
+            }
+            
+            response = await client.post(
+                "http://127.0.0.1:8002/api/inventory/deduct-for-order",
+                json=deduction_payload
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                logger.info(
+                    f"✅ Inventory deducted successfully for order {order.order_id}: "
+                    f"{len(result.get('deducted_items', []))} items deducted"
+                )
+            else:
+                logger.warning(
+                    f"⚠️ Inventory deduction failed for order {order.order_id}: "
+                    f"{response.status_code} - {response.text}"
+                )
+                
+    except httpx.RequestError as e:
+        logger.error(f"❌ Inventory service connection error for order {order.order_id}: {e}")
+        # Continue with order creation even if inventory fails
+    except Exception as e:
+        logger.error(f"❌ Unexpected error during inventory deduction for order {order.order_id}: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Update table status if applicable
     if order.table_number:
         await db.tables.update_one(
             {"table_number": order.table_number},
-            {"$set": {"status": "occupied", "current_order_id": order.id}},
+            {"$set": {"status": "occupied", "current_order_id": order.id}}
         )
-
-    # Broadcast order creation to all connected clients
+    
+    # Broadcast order creation
     await manager.broadcast({
         "type": "order_created",
         "order_id": order.id,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(IST).isoformat()
     })
-
+    
     return order
+
    
 
 
 @api_router.get("/orders", response_model=List[Order])
 async def get_orders():
-    orders_cursor = db.orders.find().sort("_id", -1)
-    orders = []
-    async for order in orders_cursor:
-        orders.append(Order(**parse_from_mongo(order)))
-    return orders
+    """Get all orders with error handling for invalid status"""
+    try:
+        orders = []
+        orders_cursor = db.orders.find().sort("created_at", -1)
+
+        async for order in orders_cursor:
+            order_dict = mongo_to_dict(order)
+
+            # ✅ Validate status before creating Order object
+            status = order_dict.get("status")
+            valid_statuses = ["pending", "cooking", "ready", "served", "cancelled"]
+
+            if status not in valid_statuses:
+                logger.warning(
+                    f"⚠️ Invalid status '{status}' for order {order_dict.get('id', 'unknown')}. "
+                    f"Skipping. Use POST /api/fix-order-status to fix this."
+                )
+                continue
+
+            # Try to validate order, skip if validation fails
+            try:
+                orders.append(Order.model_validate(order_dict))
+            except Exception as validation_error:
+                logger.error(
+                    f"❌ Validation error for order {order_dict.get('id', 'unknown')}: "
+                    f"{str(validation_error)}. Skipping this order."
+                )
+                continue
+
+        logger.info(f"✅ Successfully loaded {len(orders)} valid orders")
+        return orders
+
+    except Exception as e:
+        logger.error(f"Error fetching orders: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/fix-order-status")
+async def fix_order_status():
+    """
+    🔧 Migration endpoint to fix orders with invalid status values
+
+    Fixes common issues like:
+    - status='paid' → status='served' + payment_status='paid'
+    - status='completed' → status='served'
+    - status='done' → status='served'
+    """
+    try:
+        fixed_count = 0
+        errors = []
+
+        # List of invalid status values to fix
+        invalid_statuses = ["paid", "completed", "done", "finished"]
+
+        logger.info("🔧 Starting order status migration...")
+
+        for invalid_status in invalid_statuses:
+            # Find all orders with this invalid status
+            invalid_orders = await db.orders.find({"status": invalid_status}).to_list(length=1000)
+
+            logger.info(f"Found {len(invalid_orders)} orders with status='{invalid_status}'")
+
+            for order in invalid_orders:
+                try:
+                    order_id = order.get("order_id") or order.get("id", "unknown")
+
+                    # Determine correct status and payment_status
+                    if invalid_status == "paid":
+                        correct_status = "served"
+                        payment_status = "paid"
+                    else:
+                        correct_status = "served"
+                        payment_status = order.get("payment_status", "pending")
+
+                    # Update the order in database
+                    result = await db.orders.update_one(
+                        {"_id": order["_id"]},
+                        {
+                            "$set": {
+                                "status": correct_status,
+                                "payment_status": payment_status,
+                                "updated_at": datetime.now(IST).isoformat()
+                            }
+                        }
+                    )
+
+                    if result.modified_count > 0:
+                        fixed_count += 1
+                        logger.info(
+                            f"✅ Fixed order {order_id}: "
+                            f"status '{invalid_status}' → '{correct_status}', "
+                            f"payment_status → '{payment_status}'"
+                        )
+
+                except Exception as order_error:
+                    error_msg = f"Order {order_id}: {str(order_error)}"
+                    errors.append(error_msg)
+                    logger.error(f"❌ Error fixing order {order_id}: {order_error}")
+
+        logger.info(f"🎉 Migration complete! Fixed {fixed_count} orders")
+
+        return {
+            "success": True,
+            "message": "Order status migration completed successfully",
+            "fixed_orders": fixed_count,
+            "errors": errors if errors else None
+        }
+
+    except Exception as e:
+        logger.error(f"❌ Error in fix_order_status migration: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Migration failed: {str(e)}"
+        )
+
+
+# ✅✅✅ ADD THIS NEW ENDPOINT ✅✅✅
+@api_router.post("/fix-all-order-timestamps")
+async def fix_all_order_timestamps():
+    """
+    CRITICAL FIX: Set proper datetime objects for ALL orders.
+    This fixes old orders with missing or string-based timestamps.
+    Run this ONCE to fix all existing orders in database.
+    """
+    try:
+        from bson import ObjectId
+        fixed_count = 0
+        now_utc = datetime.now(IST)
+        
+        logger.info("🔧 Starting timestamp migration for ALL orders...")
+        
+        # Get ALL orders
+        orders_cursor = db.orders.find()
+        
+        async for order in orders_cursor:
+            order_id = order.get("_id")
+            needs_fix = False
+            update_data = {}
+            
+            # Check created_at
+            created_at = order.get("created_at")
+            if created_at is None or created_at == "" or isinstance(created_at, str):
+                # If missing or string, use current time (or try to parse string)
+                if isinstance(created_at, str):
+                    try:
+                        # Try to parse the ISO string back to datetime
+                        created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    except:
+                        created_at = now_utc
+                else:
+                    created_at = now_utc
+                
+                update_data["created_at"] = created_at
+                needs_fix = True
+            
+            # Check updated_at
+            updated_at = order.get("updated_at")
+            if updated_at is None or updated_at == "" or isinstance(updated_at, str):
+                if isinstance(updated_at, str):
+                    try:
+                        updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                    except:
+                        updated_at = now_utc
+                else:
+                    updated_at = now_utc
+                
+                update_data["updated_at"] = updated_at
+                needs_fix = True
+            
+            if needs_fix:
+                await db.orders.update_one(
+                    {"_id": order_id},
+                    {"$set": update_data}
+                )
+                fixed_count += 1
+                logger.info(f"✅ Fixed order {order_id}")
+        
+        logger.info(f"🎉 Migration complete! Fixed {fixed_count} orders")
+        
+        return {
+            "success": True,
+            "message": f"Successfully fixed {fixed_count} orders with proper datetime objects",
+            "fixed_orders": fixed_count
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Error in timestamp migration: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@api_router.get("/orders/{order_id}")
+async def get_order_by_id(order_id: str):
+    """Get a single order by ID with enriched items"""
+    try:
+        from bson import ObjectId
+        logger.info(f"🔍 Searching for order: {order_id}")
+        order = None
+        
+        # Strategy 1: Try as MongoDB ObjectId
+        if len(order_id) == 24:  # MongoDB ObjectId is 24 chars
+            try:
+                order = await db.orders.find_one({"_id": ObjectId(order_id)})
+                if order:
+                    logger.info(f"✅ Found by _id (ObjectId)")
+            except Exception as e:
+                logger.info(f"Not a valid ObjectId: {e}")
+        
+        # Strategy 2: Search ALL possible string fields
+        if not order:
+            logger.info(f"Trying string-based search...")
+            
+            # Get ONE sample order to see the actual structure
+            sample = await db.orders.find_one({})
+            if sample:
+                logger.info(f"Sample order keys: {list(sample.keys())}")
+            
+            # Try all possible ID field combinations
+            order = await db.orders.find_one({
+                "$or": [
+                    {"id": order_id},
+                    {"order_id": order_id},
+                    {"orderId": order_id},
+                    {"ordernumber": order_id},
+                    {"orderNumber": order_id},
+                    {"invoice_id": order_id},
+                    {"invoiceId": order_id},
+                    {"_id": order_id}
+                ]
+            })
+            if order:
+                logger.info(f"✅ Found by string search")
+        
+        if not order:
+            logger.error(f"❌ Order NOT FOUND: {order_id}")
+            logger.info(f"Available orders: {await db.orders.count_documents({})}")
+            raise HTTPException(status_code=404, detail=f"Order '{order_id}' not found")
+        
+        # FIX: Define items from order
+        items = order.get('items', [])
+        logger.info(f"📦 Order found! Enriching {len(items)} items...")
+        
+        # FIX: Proper enrichment that handles EMPTY menuitemid
+        enriched_items = []
+        for idx, item in enumerate(items):
+            # Try multiple field names
+            item_name = item.get("menuitemname") or item.get("name") or item.get("itemName")
+            menuitem_id = item.get("menuitemid") or item.get("menuItemId") or ""
+            
+            logger.info(f"📦 Item {idx}: ID='{menuitem_id}', Name='{item_name}'")
+            
+            # If name missing AND we have valid non-empty ID, fetch from DB
+            if not item_name and menuitem_id and menuitem_id.strip():  # Check not empty!
+                try:
+                    # FIXED: Use menu_items (with underscore)
+                    menu_item = await db.menu_items.find_one({"id": menuitem_id})
+                    if not menu_item:
+                        menu_item = await db.menu_items.find_one({"_id": menuitem_id})
+                    
+                    if menu_item:
+                        item_name = menu_item.get("name", "Unknown Item")
+                        logger.info(f"✅ Fetched: {item_name}")
+                    else:
+                        item_name = "Unknown Item"
+                        logger.warning(f"⚠️ Not found: {menuitem_id}")
+                except Exception as e:
+                    logger.error(f"❌ Error: {e}")
+                    item_name = "Unknown Item"
+            
+            # Final fallback
+            if not item_name or not item_name.strip():
+                item_name = "Unknown Item"
+            
+            enriched_items.append({
+                "name": item_name,
+                "quantity": item.get("quantity", 0),
+                "price": item.get("price", 0)
+            })
+        
+        logger.info(f"✅ Enriched {len(enriched_items)} items")
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"💥 Error fetching order {order_id}: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    # Manual conversion with proper datetime handling (OUTSIDE try block)
+    from bson import ObjectId
+    
+    orderdict = {}
+    for key, value in order.items():
+        if key == "_id":
+            orderdict["id"] = str(value)
+        elif isinstance(value, ObjectId):
+            orderdict[key] = str(value)
+        elif isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=IST)
+            else:
+                value = value.astimezone(IST)
+            orderdict[key] = value.isoformat()
+        elif isinstance(value, list):
+            orderdict[key] = []
+            for item in value:
+                if isinstance(item, dict):
+                    converted_item = {}
+                    for k, v in item.items():
+                        if isinstance(v, ObjectId):
+                            converted_item[k] = str(v)
+                        elif isinstance(v, datetime):
+                            if v.tzinfo is None:
+                                v = v.replace(tzinfo=IST)
+                            else:
+                                v = v.astimezone(IST)
+                            converted_item[k] = v.isoformat()
+                        else:
+                            converted_item[k] = v
+                    orderdict[key].append(converted_item)
+                else:
+                    orderdict[key].append(item)
+        else:
+            orderdict[key] = value
+    
+    return orderdict
+
+
+
+
+
+
 @app.router.get("/fix-order-dates")
 async def fix_order_dates():
     """Add createdat to orders that don't have it"""
@@ -1056,7 +2242,7 @@ async def fix_order_dates():
                 # Set createdat to current time
                 await db.orders.update_one(
                     {"_id": order["_id"]},
-                    {"$set": {"createdat": datetime.now(timezone.utc).isoformat()}}
+                    {"$set": {"createdat": datetime.now(IST).isoformat()}}
                 )
                 updated_count += 1
         
@@ -1097,10 +2283,10 @@ async def update_order(order_id: str, order_data: OrderUpdate = Body(...)):
             order_dict["total_amount"] = total_amount
             order_dict["gst_amount"] = gst_amount
             order_dict["final_amount"] = final_amount
-            order_dict["estimated_completion"] = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(minutes=30)
+            order_dict["estimated_completion"] = datetime.now(IST).replace(microsecond=0) + timedelta(minutes=30)
         
         logger.info(f"Calculated amounts: {order_dict}")
-        order_dict["updated_at"] = datetime.now(timezone.utc)
+        order_dict["updated_at"] = datetime.now(IST)
         
         updated = await db.orders.find_one_and_update(
             {"id": order_id},
@@ -1115,7 +2301,7 @@ async def update_order(order_id: str, order_data: OrderUpdate = Body(...)):
         await manager.broadcast({
             "type": "order_updated",
             "order_id": order_id,
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "timestamp": datetime.now(IST).isoformat()
         })
         return Order(**parse_from_mongo(updated))
         
@@ -1131,6 +2317,63 @@ async def delete_order(order_id: str):
         raise HTTPException(status_code=404, detail="Order not found")
     return {"message": "Order deleted successfully"}
 
+@api_router.post("/fix-old-orders")
+async def fix_old_order_items():
+    """
+    Migration script to add menuitemname to old orders that are missing it
+    """
+    try:
+        fixed_count = 0
+        checked_count = 0
+        
+        # Get all orders
+        orders_cursor = db.orders.find({})
+        
+        async for order in orders_cursor:
+            checked_count += 1
+            needs_update = False
+            updated_items = []
+            
+            for item in order.get("items", []):
+                # Check if menuitemname is missing or empty
+                if not item.get("menuitemname") or item.get("menuitemname") == "":
+                    needs_update = True
+                    
+                    # Try to find the menu item
+                    menu_item = await db.menu_items.find_one({"id": item.get("menuitemid")})
+                    
+                    if menu_item:
+                        # Update item with name from database
+                        item["menuitemname"] = menu_item.get("name", "Unknown Item")
+                        logger.info(f"Fixed item: {item['menuitemname']}")
+                    else:
+                        item["menuitemname"] = "Unknown Item"
+                        logger.warning(f"Could not find menu item: {item.get('menuitemid')}")
+                
+                updated_items.append(item)
+            
+            # Update order if any items were fixed
+            if needs_update:
+                await db.orders.update_one(
+                    {"_id": order["_id"]},
+                    {"$set": {"items": updated_items}}
+                )
+                fixed_count += 1
+                logger.info(f"Fixed order: {order.get('order_id', order.get('_id'))}")
+        
+        return {
+            "message": "Migration completed",
+            "checked_orders": checked_count,
+            "fixed_orders": fixed_count
+        }
+    
+    except Exception as e:
+        logger.error(f"Error fixing old orders: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @api_router.put("/orders/{order_id}/pay")
 async def pay_order(order_id: str, payment_data: dict = Body(...)):
     logger.info(f"Payment request for order {order_id}: {payment_data}")
@@ -1141,7 +2384,7 @@ async def pay_order(order_id: str, payment_data: dict = Body(...)):
         "payment_status": payment_status,
         "payment_method": payment_method,
         "status": OrderStatus.SERVED.value,
-        "updated_at": datetime.now(timezone.utc)
+        "updated_at": datetime.now(IST)
     }
     
     updated = await db.orders.find_one_and_update(
@@ -1158,16 +2401,21 @@ async def pay_order(order_id: str, payment_data: dict = Body(...)):
         "order_id": order_id,
         "payment_status": payment_status,
         "payment_method": payment_method,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(IST).isoformat()
     })
     logger.info(f"Broadcast sent for order {order_id}")  # Add logging to debug
-    return {"message": "Payment processed and order marked as served", "order": parse_from_mongo(updated)}
+    return {
+        "message": "Payment processed and order marked as served",
+        "order_id": order_id,
+        "payment_status": payment_status,
+        "payment_method": payment_method
+    }
 
 @api_router.put("/orders/{order_id}/cancel")
 async def cancel_order(order_id: str):
     updated = await db.orders.find_one_and_update(
         {"id": order_id},
-        {"$set": {"status": "cancelled", "updated_at": datetime.now(timezone.utc)}},
+        {"$set": {"status": "cancelled", "updated_at": datetime.now(IST)}},
         return_document=True
     )
     
@@ -1200,7 +2448,7 @@ async def generate_kot(order_id: str):
         "type": "kot_generated",
         "order_id": order_id,
         "kot_id": kot.id,
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(IST).isoformat()
     })
     return kot
 
@@ -1212,14 +2460,18 @@ async def get_kots():
         kots.append(KOT(**parse_from_mongo(kot)))
     return kots
 
-# ==================== DASHBOARD ENDPOINT ====================
 @api_router.get("/dashboard", response_model=DashboardStats)
 async def get_dashboard():
-    today = datetime.now(timezone.utc).date()
-    orders_today = await db.orders.count_documents({"created_at": {"$gte": today.isoformat()}})
+    # ✅ Create datetime object at midnight
+    today = datetime.now(IST).date()
+    start_of_day = datetime.combine(today, datetime.min.time()).replace(tzinfo=timezone.utc)
     
+    # ✅ Use datetime object (not string)
+    orders_today = await db.orders.count_documents({"created_at": {"$gte": start_of_day}})
+    
+    # ✅ Use datetime object in pipeline
     pipeline = [
-        {"$match": {"created_at": {"$gte": today.isoformat()}}},
+        {"$match": {"created_at": {"$gte": start_of_day}}},
         {"$group": {"_id": None, "total_revenue": {"$sum": "$final_amount"}}}
     ]
     revenue_result = await db.orders.aggregate(pipeline).to_list(length=1)
@@ -1233,6 +2485,8 @@ async def get_dashboard():
     
     kitchen_status = KitchenStatus.ACTIVE
     
+    logger.info(f"Dashboard: orders={orders_today}, revenue={total_revenue}, pending={pending_orders}")
+    
     return DashboardStats(
         today_orders=orders_today,
         today_revenue=total_revenue,
@@ -1243,96 +2497,60 @@ async def get_dashboard():
         kitchen_status=kitchen_status,
         pending_payments=pending_payments,
     )
+
 # ==================== PAYMENTS ENDPOINT ====================
 @api_router.get("/payments/{date}")
 async def get_payments_by_date(date: str):
-    """Get all paid orders for a specific date with order_id"""
     try:
-        # Parse the date
         target_date = datetime.fromisoformat(date).date()
         start_datetime = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
         end_datetime = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=timezone.utc)
         
         logger.info(f"Fetching payments for {date}")
         
-        # Query for paid orders
-        payments_query = {
-            "created_at": {
-                "$gte": start_datetime.isoformat(),
-                "$lt": end_datetime.isoformat()
-            },
+        payments_cursor = db.orders.find({
+            "created_at": {"$gte": start_datetime, "$lt": end_datetime},
             "payment_status": "paid"
-        }
+        }).sort("created_at", -1)
         
-        payments_cursor = db.orders.find(payments_query).sort("created_at", -1)
         payments_list = []
-        
         async for payment in payments_cursor:
-            payments_list.append({
-                "order_id": payment.get("order_id", "N/A"),  # ⭐ KEY FIX
-                "_id": str(payment["_id"]),
-                "final_amount": payment.get("finalamount") or payment.get("final_amount") or payment.get("totalamount") or payment.get("total_amount") or 0,
-                "payment_method": payment.get("payment_method", "N/A"),
-                "payment_status": payment.get("payment_status", "N/A"),
-                "created_at": payment.get("created_at"),
-                "customer_name": payment.get("customer_name", "Walk-in"),
-                "table_number": payment.get("table_number"),
-                "items": payment.get("items", []),  # Include order items
-                "total_amount": payment.get("totalamount") or payment.get("total_amount") or 0,
-                "gst_amount": payment.get("gstamount") or payment.get("gst_amount") or 0,
-                "gst_applicable": payment.get("gst_applicable", False)
-                
-            })
+            payments_list.append(mongo_to_dict(payment))  # ✅ ONE line does it all
         
-        logger.info(f"Found {len(payments_list)} payments for {date}")
+        logger.info(f"Found {len(payments_list)} payments")
         return payments_list
         
     except Exception as e:
-        logger.error(f"Error fetching payments for {date}: {str(e)}")
+        logger.error(f"Payment fetch error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
 @api_router.get("/payments/pending/{date}")
 async def get_pending_orders(date: str):
-    """Get all pending payment orders for a specific date"""
     try:
-        # Parse the date
         target_date = datetime.fromisoformat(date).date()
         start_datetime = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
         end_datetime = datetime.combine(target_date, datetime.max.time()).replace(tzinfo=timezone.utc)
         
         logger.info(f"Fetching pending orders for {date}")
         
-        # Query for pending payment orders
-        pending_query = {
-            "created_at": {
-                "$gte": start_datetime.isoformat(),
-                "$lt": end_datetime.isoformat()
-            },
+        pending_cursor = db.orders.find({
+            "created_at": {"$gte": start_datetime, "$lt": end_datetime},
             "payment_status": "pending"
-        }
+        }).sort("created_at", -1)
         
-        pending_cursor = db.orders.find(pending_query).sort("created_at", -1)
         pending_list = []
-        
         async for order in pending_cursor:
-            pending_list.append({
-                "order_id": order.get("order_id", "N/A"),
-                "id": str(order["_id"]),
-                "total_amount": order.get("totalamount") or order.get("total_amount") or 0,
-                "final_amount": order.get("finalamount") or order.get("final_amount") or order.get("totalamount") or 0,
-                "payment_method": "pending",
-                "payment_status": "pending",
-                "created_at": order.get("created_at"),
-                "customer_name": order.get("customer_name", "Walk-in"),
-                "table_number": order.get("table_number"),
-                "items": order.get("items", [])
-            })
+            pending_list.append(mongo_to_dict(order))  # ✅ ONE line does it all
         
-        logger.info(f"Found {len(pending_list)} pending orders for {date}")
+        logger.info(f"Found {len(pending_list)} pending orders")
         return pending_list
         
     except Exception as e:
-        logger.error(f"Error fetching pending orders for {date}: {str(e)}")
+        logger.error(f"Pending orders fetch error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 # ==================== TABLE ENDPOINTS ====================
@@ -1385,8 +2603,8 @@ async def create_customer(customer: CustomerCreate):
         customer_dict = customer.dict()
         customer_dict["id"] = str(uuid.uuid4())
         customer_dict["customer_id"] = f"CUST-{str(uuid.uuid4())[:8]}"
-        customer_dict["created_at"] = datetime.now(timezone.utc)
-        customer_dict["updated_at"] = datetime.now(timezone.utc)
+        customer_dict["created_at"] = datetime.now(IST)
+        customer_dict["updated_at"] = datetime.now(IST)
         customer_dict["order_history"] = {"total_orders": 0, "total_spent": 0.0, "average_order_value": 0.0, "last_order_date": None, "favorite_items": []}
         customer_dict["loyalty_points"] = 0
         customer_dict["status"] = "active"
@@ -1514,7 +2732,7 @@ async def update_customer(customer_id: str, customer_update: CustomerUpdate):
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
         
-        update_data["updated_at"] = datetime.now(timezone.utc)
+        update_data["updated_at"] = datetime.now(IST)
         update_data = prepare_for_mongo(update_data)
         
         result = await db.customers.update_one(
@@ -1622,7 +2840,7 @@ async def get_daily_report(date: str):
         )
         
         report_dict = prepare_for_mongo(daily_report.model_dump())
-        report_dict["updated_at"] = datetime.now(timezone.utc)
+        report_dict["updated_at"] = datetime.now(IST)
         
         result = await db.daily_reports.replace_one(
             {"date": date},
@@ -1669,7 +2887,28 @@ async def print_invoice(invoice_data: Dict[str, Any] = Body(...)):
         subtotal = invoice_data.get('subtotal', 0)
         gst = invoice_data.get('gst', 0)
         total = invoice_data.get('total', 0)
-        
+                # ✅ FIX: Enrich items with names from database
+        enriched_items = []
+        for item in items:
+            item_name = item.get("menuitemname") or item.get("name")
+            
+            # If name is missing, fetch from database
+            if not item_name and item.get("menuitemid"):
+                menu_item = await db.menu_items.find_one({"id": item.get("menuitemid")})
+                if menu_item:
+                    item_name = menu_item.get("name", "Unknown Item")
+                else:
+                    item_name = "Unknown Item"
+            elif not item_name:
+                item_name = "Unknown Item"
+            
+            enriched_items.append({
+                "name": item_name,
+                "quantity": item.get("quantity", 0),
+                "price": item.get("price", 0)
+            })
+
+
         html_content = f"""<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Invoice {invoice_no}</title>
 <style>
@@ -1678,9 +2917,9 @@ async def print_invoice(invoice_data: Dict[str, Any] = Body(...)):
 <script>window.onload=function(){{window.print();setTimeout(function(){{window.close()}},500)}};</script>
 </head><body>
 <div class="header"><h1>Taste Paradise</h1><p>Restaurant & Billing Service</p><p>123 Food Street, Flavor City, FC 12345</p><p>Phone: +91 98765 43210 | Email: info@tasteparadise.com</p></div>
-<div class="invoice-info"><div><h3>Invoice #{invoice_no}</h3><p>Date: {datetime.now().strftime('%d/%m/%Y')}</p><p>Time: {datetime.now().strftime('%H:%M:%S')}</p></div><div><h3>Bill To</h3><p>{customer_name}</p><p>Table: {table_no}</p></div></div>
+<div class="invoice-info"><div><h3>Invoice #{invoice_no}</h3><p>Date: {datetime.now(IST).strftime('%d/%m/%Y')}</p><p>Time: {datetime.now(IST).strftime('%H:%M:%S')}</p></div><div><h3>Bill To</h3><p>{customer_name}</p><p>Table: {table_no}</p></div></div>
 <table><thead><tr><th>Item</th><th class="text-center">Qty</th><th class="text-right">Rate (₹)</th><th class="text-right">Amount (₹)</th></tr></thead><tbody>
-{"".join([f'<tr><td>{item.get("menuitemname", item.get("name", ""))}</td><td class="text-center">{item.get("quantity", 0)}</td><td class="text-right">₹{item.get("price", 0):.2f}</td><td class="text-right">₹{(item.get("quantity", 0) * item.get("price", 0)):.2f}</td></tr>' for item in items])}
+{"".join([f'<tr><td>{item["name"]}</td><td class="text-center">{item.get("quantity", 0)}</td><td class="text-right">₹{item.get("price", 0):.2f}</td><td class="text-right">₹{(item.get("quantity", 0) * item.get("price", 0)):.2f}</td></tr>' for item in enriched_items])}
 </tbody></table>
 <div class="totals"><div><strong>Subtotal:</strong> ₹{subtotal:.2f}</div><div><strong>GST (5%):</strong> ₹{gst:.2f}</div><div class="total-line">Total Amount: ₹{total:.2f}</div></div>
 <div class="footer"><p><strong>Thank you for dining with us at Taste Paradise!</strong></p><p>GST No: 27AAAAA0000A1Z5 | FSSAI Lic: 12345678901234</p><p>This is a computer generated invoice.</p></div>
@@ -1860,12 +3099,34 @@ async def print_thermal(invoice_data: Dict[str, Any] = Body(...)):
         receipt += f"{'Item':<25}{'Qty':>5}{'Price':>8}{'Amount':>10}\n"
         receipt += "-" * 48 + "\n"
         
+# ✅ FIX: Enrich items with names from database
+        enriched_items_thermal = []
         for item in items:
-            name = str(item.get('menuitemname', ''))[:23]
-            qty = item.get('quantity', 0)
-            price = item.get('price', 0)
-            amount = qty * price
-            receipt += f"{name:<25}{qty:>5}{price:>8.2f}{amount:>10.2f}\n"
+            item_name = item.get("menuitemname") or item.get("name")
+    
+    # If name is missing, fetch from database
+            if not item_name and item.get("menuitemid"):
+                menu_item = await db.menu_items.find_one({"id": item.get("menuitemid")})
+                if menu_item:
+                    item_name = menu_item.get("name", "Unknown Item")
+                else:
+                    item_name = "Unknown Item"
+            elif not item_name:
+                item_name = "Unknown Item"
+    
+            enriched_items_thermal.append({
+                "name": item_name,
+                "quantity": item.get("quantity", 0),
+                "price": item.get("price", 0)
+            })
+
+        for item in enriched_items_thermal:
+            name = str(item["name"])[:23]
+        qty = item["quantity"]
+        price = item["price"]
+        amount = qty * price
+        receipt += f"{name:<25}{qty:>5}{price:>8.2f}{amount:>10.2f}\n"
+        
         
         receipt += "-" * 48 + "\n"
         receipt += f"{'Subtotal:':<38}Rs.{subtotal:>8.2f}\n"
@@ -2110,19 +3371,21 @@ app.mount("/", StaticFiles(directory=str(APP_DIR / "frontend" / "build"), html=T
 # ================================
 
 # ==================== SERVER ====================
-def start_server():
-    uvicorn.run(app, host="127.0.0.1", port=8002, log_level="error")
 
 # ==================== MAIN ====================
 def start_server():
-    """Start FastAPI server in thread"""
+    """Start FastAPI server - works on localhost AND Railway"""
+    port = int(os.getenv("PORT", 8002))
+    host = "0.0.0.0"
+    
     uvicorn.run(
         app,
-        host="127.0.0.1",
-        port=8002,
+        host=host,
+        port=port,
         log_level="error",
         access_log=False
     )
+
 # ==================== CUSTOMER ENDPOINTS ====================
 # ==================== CUSTOMER ENDPOINTS ====================
 
@@ -2141,8 +3404,8 @@ async def create_customer(customer: CustomerCreate):
         customer_dict = customer.dict()
         customer_dict["id"] = str(uuid.uuid4())
         customer_dict["customer_id"] = f"CUST-{str(uuid.uuid4())[:8]}"
-        customer_dict["created_at"] = datetime.now(timezone.utc)
-        customer_dict["updated_at"] = datetime.now(timezone.utc)
+        customer_dict["created_at"] = datetime.now(IST)
+        customer_dict["updated_at"] = datetime.now(IST)
         customer_dict["order_history"] = {
             "total_orders": 0,
             "total_spent": 0.0,
@@ -2229,7 +3492,7 @@ async def update_customer(customer_id: str, customer_update: CustomerUpdate):
         if not update_data:
             raise HTTPException(status_code=400, detail="No fields to update")
         
-        update_data["updated_at"] = datetime.now(timezone.utc)
+        update_data["updated_at"] = datetime.now(IST)
         update_data = prepare_for_mongo(update_data)
         
         result = await db.customers.update_one(
@@ -2352,9 +3615,9 @@ async def update_customer_order_history(customer_id: str, order_total: float):
                     "order_history.total_orders": total_orders,
                     "order_history.total_spent": round(total_spent, 2),
                     "order_history.average_order_value": round(avg_order_value, 2),
-                    "order_history.last_order_date": datetime.now(timezone.utc),
+                    "order_history.last_order_date": datetime.now(IST),
                     "loyalty_points": customer.get("loyalty_points", 0) + int(order_total / 10),
-                    "updated_at": datetime.now(timezone.utc)
+                    "updated_at": datetime.now(IST)
                 }
             }
         )
@@ -2416,7 +3679,10 @@ if __name__ == "__main__":
     # ============================================================
     try:
         print("⏳ Connecting to MongoDB...")
-        mongo_client = AsyncIOMotorClient("mongodb://127.0.0.1:27017/")
+        # Railway provides MONGO_URL, use localhost for local development
+        MONGODB_URL = os.getenv("MONGO_URL", "mongodb://127.0.0.1:27017/")
+        print(f"🔗 MongoDB URL: {MONGODB_URL[:30]}...") # Log partial URL for debugging
+        mongo_client = AsyncIOMotorClient(MONGODB_URL)
         db = mongo_client["taste_paradise"]
         
         # Test connection
@@ -2439,15 +3705,7 @@ if __name__ == "__main__":
     # ============================================================
     # START FASTAPI SERVER
     # ============================================================
-    def start_server():
-        """Start FastAPI server in background thread"""
-        uvicorn.run(
-            app,
-            host="127.0.0.1",
-            port=8002,
-            log_level="error"
-        )
-    
+
     # Start server in background thread
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()
@@ -2460,14 +3718,18 @@ if __name__ == "__main__":
     # ============================================================
     def check_server():
         """Check if server is responding"""
+        import os
+        port = int(os.getenv("PORT", 8002))  # ← Read PORT from environment
+    
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
-            result = sock.connect_ex(('127.0.0.1', 8002))
+            result = sock.connect_ex(('127.0.0.1', port))  # ← Use dynamic port
             sock.close()
             return result == 0
         except:
             return False
+
     
     max_retries = 10
     for i in range(max_retries):

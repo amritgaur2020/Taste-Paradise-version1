@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Body
 from typing import List, Optional
 from datetime import datetime, timezone
 import logging
+from bson import ObjectId
 
 from models.soundbox_models import (
     SoundboxConfigModel,
@@ -17,7 +18,6 @@ from models.soundbox_models import (
 from services.payment_matcher import PaymentMatcher
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api", tags=["payments"])
 
 # This will be injected from main.py
@@ -28,6 +28,37 @@ def init_payment_routes(database):
     global db
     db = database
 
+# ============================================================================
+# ✅ MONGODB TO DICT CONVERTER - CENTRALIZED SOLUTION
+# ============================================================================
+def mongo_to_dict(doc):
+    """
+    Convert MongoDB document to JSON-serializable dict
+    Handles: ObjectId, datetime, nested dicts, lists
+    This is the SINGLE source of truth for serialization
+    """
+    if doc is None:
+        return None
+    
+    if isinstance(doc, list):
+        return [mongo_to_dict(item) for item in doc]
+    
+    if isinstance(doc, dict):
+        result = {}
+        for key, value in doc.items():
+            if key == "_id":
+                result["id"] = str(value) if isinstance(value, ObjectId) else value
+            else:
+                result[key] = mongo_to_dict(value)
+        return result
+    
+    if isinstance(doc, ObjectId):
+        return str(doc)
+    
+    if isinstance(doc, datetime):
+        return doc.isoformat()
+    
+    return doc
 
 # ============================================================================
 # SOUNDBOX CONFIGURATION ENDPOINTS
@@ -51,8 +82,8 @@ async def create_soundbox_config(config_data: SoundboxConfigCreate):
             )
             
             updated_config = await db.soundbox_configs.find_one({"_id": existing_config["_id"]})
-            updated_config["id"] = str(updated_config.pop("_id"))
-            
+            # ✅ Use mongo_to_dict for conversion
+            updated_config = mongo_to_dict(updated_config)
             logger.info(f"✅ Soundbox config updated: {config_data.provider}")
             return SoundboxConfigModel(**updated_config)
         
@@ -67,14 +98,12 @@ async def create_soundbox_config(config_data: SoundboxConfigCreate):
         
         result = await db.soundbox_configs.insert_one(config_dict)
         config_dict["id"] = str(result.inserted_id)
-        
         logger.info(f"✅ Soundbox config created: {config.provider}")
         return config
         
     except Exception as e:
         logger.error(f"Error creating soundbox config: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.get("/soundbox/config", response_model=SoundboxConfigModel)
 async def get_soundbox_config():
@@ -85,14 +114,13 @@ async def get_soundbox_config():
         if not config:
             raise HTTPException(status_code=404, detail="Soundbox config not found")
         
-        # Convert ObjectId to string
-        config["id"] = str(config.pop("_id"))
-        
+        # ✅ Use mongo_to_dict for conversion
+        config = mongo_to_dict(config)
         return SoundboxConfigModel(**config)
+        
     except Exception as e:
         logger.error(f"Error fetching soundbox config: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.put("/soundbox/config", response_model=SoundboxConfigModel)
 async def update_soundbox_config(config_data: SoundboxConfigUpdate):
@@ -113,15 +141,15 @@ async def update_soundbox_config(config_data: SoundboxConfigUpdate):
         )
         
         updated = await db.soundbox_configs.find_one({"_id": existing_config["_id"]})
-        updated["id"] = str(updated.pop("_id"))
-        
+        # ✅ Use mongo_to_dict for conversion
+        updated = mongo_to_dict(updated)
         return SoundboxConfigModel(**updated)
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error updating soundbox config: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.delete("/soundbox/config")
 async def disconnect_soundbox():
@@ -145,7 +173,8 @@ async def disconnect_soundbox():
         
         # Return the updated config with is_active = False
         updated_config = await db.soundbox_configs.find_one({"_id": config["_id"]})
-        updated_config["id"] = str(updated_config.pop("_id"))
+        # ✅ Use mongo_to_dict for conversion
+        updated_config = mongo_to_dict(updated_config)
         
         return {
             "status": "success",
@@ -160,7 +189,6 @@ async def disconnect_soundbox():
     except Exception as e:
         logger.error(f"Error disconnecting soundbox: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.post("/soundbox/test-connection")
 async def test_soundbox_connection():
@@ -197,16 +225,14 @@ async def test_soundbox_connection():
             "connected": False
         }
 
-
 # ============================================================================
-# PAYMENT WEBHOOK ENDPOINTS (NEW - SIMPLIFIED VERSION)
+# PAYMENT WEBHOOK ENDPOINTS
 # ============================================================================
 
 @router.post("/webhook/soundbox")
 async def soundbox_webhook_simple(payload: dict):
     """
     Receive payment notifications from Paytm/PhonePe Soundbox
-    
     Simplified version that works with basic payload structure
     """
     try:
@@ -263,13 +289,12 @@ async def soundbox_webhook_simple(payload: dict):
                 "message": "Payment received, no matching order",
                 "matched": False
             }
-        
+            
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Error processing webhook: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 async def auto_match_payment(amount: float, transaction_id: str):
     """Auto-match payment to pending order by amount"""
@@ -289,15 +314,14 @@ async def auto_match_payment(amount: float, transaction_id: str):
         # Match to oldest pending order
         order = pending_orders[0]
         order_id = order.get("order_id")
-        
         logger.info(f"🎯 Matching to order: {order_id}")
         
-        # ✅ FIXED: Update order with correct field name
+        # Update order with correct field name
         update_result = await db.orders.update_one(
-            {"order_id": order_id},  # ← FIXED: Changed from "id" to "order_id"
+            {"order_id": order_id},
             {"$set": {
                 "payment_status": "paid",
-                "payment_method": "online",  # ✅ This sets it to "online"
+                "payment_method": "online",
                 "transaction_id": transaction_id,
                 "paid_at": datetime.now(timezone.utc).isoformat(),
                 "status": "served",
@@ -328,7 +352,6 @@ async def auto_match_payment(amount: float, transaction_id: str):
         traceback.print_exc()
         return None
 
-
 @router.post("/webhook/soundbox/test")
 async def test_webhook():
     """Test endpoint to simulate payment notification"""
@@ -339,13 +362,11 @@ async def test_webhook():
         "payment_method": "upi",
         "status": "success"
     }
-    
     result = await soundbox_webhook_simple(test_payload)
     return result
 
-
 # ============================================================================
-# PAYMENT HISTORY ENDPOINTS (NEW)
+# PAYMENT HISTORY ENDPOINTS
 # ============================================================================
 
 @router.get("/payments/history")
@@ -375,9 +396,8 @@ async def get_payment_history(
         # Fetch payments
         payments = await db.payments.find(query).sort("timestamp", -1).limit(limit).to_list(length=limit)
         
-        # Convert ObjectId to string
-        for payment in payments:
-            payment["id"] = str(payment.pop("_id"))
+        # ✅ Convert all payments using mongo_to_dict
+        payments = [mongo_to_dict(payment) for payment in payments]
         
         return {
             "payments": payments,
@@ -388,15 +408,14 @@ async def get_payment_history(
         logger.error(f"Error fetching payment history: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @router.get("/payments/unmatched")
 async def get_unmatched_payments():
     """Get all unmatched payments"""
     try:
         unmatched = await db.payments.find({"matched": False}).sort("timestamp", -1).to_list(length=100)
         
-        for payment in unmatched:
-            payment["id"] = str(payment.pop("_id"))
+        # ✅ Convert all payments using mongo_to_dict
+        unmatched = [mongo_to_dict(payment) for payment in unmatched]
         
         return {
             "unmatched_payments": unmatched,
@@ -406,7 +425,6 @@ async def get_unmatched_payments():
     except Exception as e:
         logger.error(f"Error fetching unmatched payments: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @router.post("/payments/{payment_id}/match/{order_id}")
 async def manual_match_payment(payment_id: str, order_id: str):
@@ -455,9 +473,8 @@ async def manual_match_payment(payment_id: str, order_id: str):
         logger.error(f"Error matching payment: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-
 # ============================================================================
-# PAYMENT STATISTICS (BONUS)
+# ✅ PAYMENT STATISTICS - FIXED WITH mongo_to_dict()
 # ============================================================================
 
 @router.get("/payments/stats")
@@ -487,7 +504,10 @@ async def get_payment_stats(date: Optional[str] = None):
             }
         }).to_list(length=1000)
         
-        # Separate by payment method
+        # ✅ CRITICAL FIX: Convert ALL orders using mongo_to_dict FIRST
+        all_paid_orders = [mongo_to_dict(order) for order in all_paid_orders]
+        
+        # Separate by payment method (now safe to use)
         online_orders = [o for o in all_paid_orders if o.get("payment_method") == "online"]
         cash_orders = [o for o in all_paid_orders if o.get("payment_method") == "cash"]
         unknown_orders = [o for o in all_paid_orders if not o.get("payment_method")]
@@ -513,6 +533,9 @@ async def get_payment_stats(date: Optional[str] = None):
             }
         }).to_list(length=100)
         
+        # ✅ Convert pending orders
+        pending_orders = [mongo_to_dict(order) for order in pending_orders]
+        
         # =====================================================================
         # GET WEBHOOK PAYMENTS (from soundbox/test webhook)
         # =====================================================================
@@ -523,26 +546,31 @@ async def get_payment_stats(date: Optional[str] = None):
             }
         }).to_list(length=1000)
         
+        # ✅ Convert webhook payments
+        today_payments = [mongo_to_dict(payment) for payment in today_payments]
+        
         # Count matched/unmatched webhook payments
         matched_count = sum(1 for p in today_payments if p.get("matched", False))
         unmatched_count = len(today_payments) - matched_count
         
+        # Return plain dict (all ObjectIds converted to strings)
         return {
             "total_payments_today": len(all_paid_orders),  # Total ORDERS paid
-            "total_amount": total_amount,
+            "total_amount": float(total_amount),
             "matched_payments": matched_count,  # Webhook payments matched
             "unmatched_payments": unmatched_count,  # Webhook payments unmatched
             "pending_orders": pending_orders,
-            "today_online": total_online,
-            "today_cash": total_cash,
-            "today_unknown": total_unknown,  # NEW: Orders with no payment method
+            "today_online": float(total_online),
+            "today_cash": float(total_cash),
+            "today_unknown": float(total_unknown),
             "online_orders_count": len(online_orders),
             "cash_orders_count": len(cash_orders),
-            "unknown_orders_count": len(unknown_orders),  # NEW
+            "unknown_orders_count": len(unknown_orders),
             "date": start_of_day.isoformat()
         }
         
     except Exception as e:
         logger.error(f"❌ Error fetching payment stats: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-

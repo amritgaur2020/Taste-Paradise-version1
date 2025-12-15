@@ -1,101 +1,164 @@
-import React, { useRef } from "react";
+import React, { useRef, useEffect, useState } from "react";
 import "./InvoicePrint.css";
 import PrintInvoice from "./PrintInvoice";
 
 const InvoiceTemplate = (props) => {
   const invoiceRef = useRef();
-  const orderData = props.orderData || {};
+  const [orderData, setOrderData] = useState(props.orderData || {});
+
+  // Update orderData when props change
+  useEffect(() => {
+    console.log('🔄 InvoiceTemplate props updated:', props.orderData);
+    if (props.orderData) {
+      setOrderData(props.orderData);
+      console.log('📦 Items in order:', props.orderData.items);
+    }
+  }, [props.orderData]);
 
   const handlePrint = () => {
     const printContents = invoiceRef.current.outerHTML;
     const printWindow = window.open("", "", "width=400,height=600,left=200,top=200");
+    
     printWindow.document.write(`
+      <!DOCTYPE html>
       <html>
-      <head>
-        <title>Print Invoice</title>
-        <link rel="stylesheet" type="text/css" href="InvoicePrint.css" />
-        <style>
-          @page { size: 80mm auto; margin: 0; }
-          body { background: #fff; margin: 0; }
-        </style>
-      </head>
-      <body>${printContents}</body>
+        <head>
+          <title>Invoice - ${orderData.id || orderData.order_id || 'NA'}</title>
+          <style>
+            @media print {
+              @page { size: 80mm auto; margin: 0; }
+              body { margin: 0; padding: 10px; font-family: Arial, sans-serif; }
+            }
+            body { font-family: Arial, sans-serif; max-width: 80mm; margin: 0 auto; }
+            table { width: 100%; border-collapse: collapse; margin: 10px 0; }
+            th, td { padding: 5px; text-align: left; border-bottom: 1px solid #ddd; }
+            .text-center { text-align: center; }
+            .text-right { text-align: right; }
+            .font-bold { font-weight: bold; }
+            .border-top { border-top: 2px solid #000; }
+          </style>
+        </head>
+        <body>${printContents}</body>
       </html>
     `);
+    
     printWindow.document.close();
     printWindow.focus();
     setTimeout(() => {
       printWindow.print();
       printWindow.close();
-    }, 500);
+    }, 250);
   };
+
+  // Safety check
+  const items = orderData?.items || [];
+  console.log('🎯 Rendering invoice with items:', items);
 
   return (
     <div>
-      <div className="invoice-container" ref={invoiceRef}>
-        <div className="invoice-header">
-          <h2 style={{ margin: "5px 0", color: "#d97706", fontSize: "18px" }}>Taste Paradise</h2>
-          <p style={{ margin: "2px 0", fontSize: "11px" }}>Restaurant & Billing Service</p>
-          <p style={{ margin: "2px 0", fontSize: "10px" }}>123 Food Street, Flavor City, FC 12345</p>
-          <p style={{ margin: "2px 0", fontSize: "10px" }}>Phone: +91 98765 43210</p>
+      <div ref={invoiceRef} style={{ padding: "20px", maxWidth: "80mm", margin: "0 auto" }}>
+        {/* Header */}
+        <div className="text-center" style={{ borderBottom: "2px solid #d97706", paddingBottom: "10px", marginBottom: "10px" }}>
+          <h2 style={{ margin: 0, fontSize: "20px", color: "#d97706" }}>Taste Paradise</h2>
+          <p style={{ margin: "5px 0", fontSize: "12px" }}>Restaurant & Billing Service</p>
+          <p style={{ margin: "5px 0", fontSize: "10px" }}>123 Food Street, Flavor City, FC 12345</p>
+          <p style={{ margin: "5px 0", fontSize: "10px" }}>Phone: +91 8218355207 | Email: info@tasteparadise.com</p>
         </div>
-        <hr style={{ border: "1px dashed #000", margin: "10px 0" }} />
-        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "10px", fontSize: "11px" }}>
+
+        {/* Invoice Number and Date */}
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "15px", fontSize: "12px" }}>
           <div>
-            <p style={{ margin: "3px 0" }}><strong>Bill To:</strong></p>
-            <p style={{ margin: "3px 0" }}>{orderData.customerName || "Walk-in Customer"}</p>
-            {orderData.tableNo && <p style={{ margin: "3px 0" }}>Table: {orderData.tableNo}</p>}
+            <p style={{ margin: "2px 0", fontWeight: "bold", fontSize: "16px" }}>INVOICE</p>
+            <p style={{ margin: "2px 0" }}>{orderData.order_id || orderData.id || 'NA'}</p>
           </div>
           <div style={{ textAlign: "right" }}>
-            <p style={{ margin: "3px 0" }}><strong>INVOICE</strong></p>
-            <p style={{ margin: "3px 0" }}>{orderData.invoiceNo || orderData.order_id || orderData.id || 'NA'}</p>
-            <p style={{ margin: "3px 0" }}>{new Date().toLocaleDateString("en-IN")}</p>
-            <p style={{ margin: "3px 0" }}>{new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}</p>
+            <p style={{ margin: "2px 0" }}>Date: {new Date().toLocaleDateString("en-IN")}</p>
+            <p style={{ margin: "2px 0" }}>Time: {new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}</p>
           </div>
         </div>
-        <hr style={{ border: "1px dashed #000", margin: "4px 0" }} />
-        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "10px", fontSize: "11px" }}>
+
+        {/* Bill To and Order Details */}
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "15px", fontSize: "12px" }}>
           <div>
-            <p style={{ margin: "3px 0" }}><strong>Order Details:</strong></p>
-            <p style={{ margin: "3px 0" }}>Status: {orderData.status}</p>
-            <p style={{ margin: "3px 0" }}>Payment: {orderData.paymentStatus}</p>
-            <p style={{ margin: "3px 0" }}>Method: {orderData.paymentMethod}</p>
+            <p style={{ margin: "2px 0", fontWeight: "bold" }}>Bill To:</p>
+            <p style={{ margin: "2px 0" }}>{orderData.customer_name || "Walk-in"}</p>
+            <p style={{ margin: "2px 0" }}>Table: {orderData.table_number || 0}</p>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <p style={{ margin: "2px 0", fontWeight: "bold" }}>Order Details:</p>
+            <p style={{ margin: "2px 0" }}>Status: {orderData.status}</p>
+            <p style={{ margin: "2px 0" }}>Payment: {orderData.payment_status}</p>
+            <p style={{ margin: "2px 0" }}>Method: {orderData.payment_method}</p>
           </div>
         </div>
-        <table className="invoice-table">
+
+        {/* Items Table */}
+        <table style={{ width: "100%", fontSize: "11px", border: "1px solid #ddd", marginBottom: "15px" }}>
           <thead>
-            <tr>
-              <th>Item</th>
-              <th style={{ textAlign: "center" }}>Qty</th>
-              <th style={{ textAlign: "right" }}>Rate (₹)</th>
-              <th style={{ textAlign: "right" }}>Amount (₹)</th>
+            <tr style={{ backgroundColor: "#f5f5f5", borderBottom: "2px solid #d97706" }}>
+              <th style={{ textAlign: "left", padding: "8px", fontWeight: "bold" }}>Item</th>
+              <th style={{ textAlign: "center", padding: "8px", fontWeight: "bold" }}>Qty</th>
+              <th style={{ textAlign: "right", padding: "8px", fontWeight: "bold" }}>Rate (₹)</th>
+              <th style={{ textAlign: "right", padding: "8px", fontWeight: "bold" }}>Amount (₹)</th>
             </tr>
           </thead>
           <tbody>
-            {orderData.items && orderData.items.map((item, idx) => (
-              <tr key={idx}>
-                <td>{item.name}</td>
-                <td style={{ textAlign: "center" }}>{item.quantity}</td>
-                <td style={{ textAlign: "right" }}>{item.rate.toFixed(2)}</td>
-                <td style={{ textAlign: "right" }}>{(item.rate * item.quantity).toFixed(2)}</td>
+            {items.length > 0 ? (
+              items.map((item, index) => {
+                const itemName = item?.menuitemname || item?.name || 'Unknown Item';
+                const quantity = item?.quantity || 0;
+                const price = parseFloat(item?.price || item?.rate || 0);
+                const amount = price * quantity;
+                
+                console.log(`📝 Item ${index}:`, itemName, 'Qty:', quantity, 'Price:', price);
+                
+                return (
+                  <tr key={index} style={{ borderBottom: "1px solid #eee" }}>
+                    <td style={{ padding: "8px" }}>{itemName}</td>
+                    <td style={{ textAlign: "center", padding: "8px" }}>{quantity}</td>
+                    <td style={{ textAlign: "right", padding: "8px" }}>₹{price.toFixed(2)}</td>
+                    <td style={{ textAlign: "right", padding: "8px" }}>₹{amount.toFixed(2)}</td>
+                  </tr>
+                );
+              })
+            ) : (
+              <tr>
+                <td colSpan="4" style={{ textAlign: "center", padding: "20px", color: "#999" }}>
+                  No items found
+                </td>
               </tr>
-            ))}
+            )}
           </tbody>
         </table>
-        <div className="invoice-total">
-          <div className="subtotal-row">Subtotal: ₹{orderData.subtotal?.toFixed(2) || "0.00"}</div>
-          <div className="gst-row">GST (5%): ₹{orderData.gst?.toFixed(2) || "0.00"}</div>
-          <div className="total-amount-row">Total Amount: ₹{orderData.total?.toFixed(2) || "0.00"}</div>
-        </div>
-        <div className="invoice-footer">
-          <div className="thank-you">Thank you for dining with us at Taste Paradise!</div>
-          <div className="footer-info">
-            GST No: 27AAAAA0000A1Z5 | FSSAI Lic: 12345678901234<br />
-            This is a computer generated invoice.
+
+        {/* Totals */}
+        <div style={{ borderTop: "2px solid #333", paddingTop: "10px", fontSize: "12px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", margin: "5px 0" }}>
+            <span style={{ fontWeight: "bold" }}>Subtotal:</span>
+            <span>₹{(parseFloat(orderData.total_amount || 0)).toFixed(2)}</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", margin: "5px 0", paddingBottom: "10px", borderBottom: "2px solid #d97706" }}>
+            <span style={{ fontWeight: "bold" }}>GST (5%):</span>
+            <span>₹{(parseFloat(orderData.total_amount || 0) * 0.05).toFixed(2)}</span>
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-between", margin: "10px 0", fontWeight: "bold", fontSize: "16px" }}>
+            <span>Total Amount:</span>
+            <span>₹{(parseFloat(orderData.total_amount || 0) * 1.05).toFixed(2)}</span>
           </div>
         </div>
+
+        {/* Footer */}
+        <div style={{ textAlign: "center", marginTop: "20px", fontSize: "10px", borderTop: "1px solid #ddd", paddingTop: "10px" }}>
+          <p style={{ margin: "5px 0", fontWeight: "bold" }}>Thank you for dining with us at Taste Paradise!</p>
+          <p style={{ margin: "5px 0" }}>GST No: 27AAAAA0000A1Z5 | FSSAI Lic: 12345678901234</p>
+          <p style={{ margin: "5px 0" }}>This is a computer generated invoice.</p>
+        </div>
       </div>
-      <PrintInvoice onPrint={handlePrint} />
+
+      {/* Print Button */}
+      <div style={{ textAlign: "center", marginTop: "20px" }}>
+        <PrintInvoice onPrint={handlePrint} orderData={orderData} />
+      </div>
     </div>
   );
 };

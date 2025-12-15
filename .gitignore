@@ -53,3 +53,15 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+
+# AI Models - TOO LARGE FOR GITHUB
+TasteParadise-AI-Service/
+models/
+*.safetensors
+*.bin
+*.onnx
+*.pt
+*.pth
+*.h5
+*.pkl
+*.joblib

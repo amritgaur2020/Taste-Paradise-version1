@@ -35,8 +35,17 @@ import ConfigureSoundboxModal from './components/Payments/ConfigureSoundboxModal
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
 import './components/InvoicePrint.css';
 import CustomerDetailsModal from './components/CustomerDetailsModal';
+import ChatbotButton from './components/ChatbotButton';
+import ChatbotModal from './components/ChatbotModal';
 import OrderTypeSelector from './components/OrderTypeSelector';
 import AddCustomerModal from './components/AddCustomerModal';
+// ✅ INVENTORY SYSTEM IMPORTS
+import InventoryDashboard from './pages/inventory/InventoryDashboard';
+import InventoryList from './pages/inventory/InventoryList';
+import AddInventoryItem from './pages/inventory/AddInventoryItem';
+import ImportInventory from './pages/inventory/ImportInventory';
+import StockTransactions from './pages/inventory/StockTransactions';
+import LowStockAlerts from './pages/inventory/LowStockAlerts';
 import OpenItemModal from './components/OpenItemModal';
 import DiscountSection from './components/DiscountSection';
 import VegNonVegIcon from './components/VegNonVegIcon';
@@ -55,6 +64,7 @@ import {
   DialogHeader,
   DialogTitle,
   DialogTrigger,
+  DialogDescription,
 } from './components/ui/dialog';
 import { Input } from './components/ui/input';
 import { Label } from './components/ui/label';
@@ -105,7 +115,7 @@ import {
   History,
   AlertTriangle,
   Zap,
-}
+ Package,}
  from 'lucide-react';
 import './App.css';
 
@@ -742,6 +752,7 @@ const Navigation = () => {
     { path: '/kot', label: 'KOT', icon: ChefHat },
     { path: '/menu', label: 'Menu', icon: Edit3 },
     { path: '/daily-report', label: 'Daily Report', icon: FileText },
+    { path: '/inventory', label: 'Inventory', icon: Package },
     { path: '/payments', label: 'Payments', icon: Wallet }
   ];
 
@@ -1023,7 +1034,9 @@ const Dashboard = () => {
 const InvoiceModal = ({ order, isOpen, onClose, onPaymentComplete }) => {
   console.log('Order data:', order);
   console.log('createdat value:', order?.createdat);
-const currentDate = order?.createdat ? new Date(order.createdat) : new Date();
+const orderDate = order?.createdat || order?.created_at 
+  ? new Date(order.createdat || order.created_at) 
+  : new Date(); // Fallback to current date if missing;
 
   const gstRate = 0.05; // 5% GST
   const subtotal = order?.total_amount || 0;
@@ -1088,16 +1101,20 @@ const currentDate = order?.createdat ? new Date(order.createdat) : new Date();
   if (!order) return null;
 
     return (
-    <Dialog open={isOpen} onOpenChange={onClose}>
-      <style>{`
-        @media print {
-          @page { size: 80mm auto; margin: 0; }
-  }
-`}</style>
-
-      <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
-        <div className="invoice-container bg-white p-8 print:fixed print:inset-0 print:z-50 print:w-[80mm]" id="invoice-content" style={{overflow: 'visible', maxHeight: 'none'}}>
-
+  <Dialog open={isOpen} onOpenChange={onClose}>
+    <style>
+      {`@media print { @page { size: 80mm auto; margin: 0; } }`}
+    </style>
+    <DialogContent className="max-w-4xl max-h-90vh overflow-y-auto">
+      {/* Add DialogHeader for accessibility */}
+      <DialogHeader className="sr-only">
+        <DialogTitle>Invoice - {order?.orderid || 'Order Details'}</DialogTitle>
+        <DialogDescription>
+          Customer invoice for {order?.customername || 'Walk-in Customer'}
+        </DialogDescription>
+      </DialogHeader>
+      
+      <div className="invoice-container bg-white p-8 print:fixed print:inset-0 print:z-50 print:w-80mm" id="invoice-content" style={{overflow: 'visible', maxHeight: 'none'}}>
 
           {/* Invoice Header */}
           <div className="border-b-2 border-orange-600 pb-4 mb-6">
@@ -1105,18 +1122,25 @@ const currentDate = order?.createdat ? new Date(order.createdat) : new Date();
               <div>
                 <h1 className="text-3xl font-bold text-orange-600">Taste Paradise</h1>
                 <p className="text-gray-600">Restaurant & Billing Service</p>
-                <p className="text-sm text-gray-500">123 Food Street, Flavor City, FC 12345</p>
-                <p className="text-sm text-gray-500">Phone: +91 8218355207 | Email: info@tasteparadise.com</p>
+                <p className="text-sm text-gray-500"> Kumar tyre service </p>
+                <p className="text-sm text-gray-500"> 8218355207 | aureusnexus04@gmail.com </p>
               </div>
               <div className="text-right">
                 <h2 className="text-2xl font-bold text-gray-800">INVOICE</h2>
                 <p className="text-gray-600">{order.order_id}</p>
                 <p className="text-sm text-gray-500">
-                  Date: {order?.created_at ? new Date(order.created_at).toLocaleDateString('en-IN') : new Date().toLocaleDateString('en-IN')}
+                  📅 Date: {orderDate.toLocaleDateString('en-IN') }
                 </p>
                 <p className="text-sm text-gray-500">
-                  Time: {order?.created_at ? new Date(order.created_at).toLocaleTimeString('en-IN') : new Date().toLocaleTimeString('en-IN')}
+                  ⏰ Time: {
+                        orderDate.toLocaleTimeString('en-IN', {
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit'
+                      })
+                   }
                 </p>
+
               </div>
             </div>
           </div>
@@ -1159,13 +1183,21 @@ const currentDate = order?.createdat ? new Date(order.createdat) : new Date();
                 {order.items.map((item, index) => (
                   <tr key={index}>
                     <td className="border border-gray-300 px-4 py-2">
-                      <div>
-                        <p className="font-medium">{item.menu_item_name}</p>
-                        {item.special_instructions && (
-                          <p className="text-sm text-gray-500 italic">Note: {item.special_instructions}</p>
-                        )}
-                      </div>
-                    </td>
+  <div>
+    <p className="font-medium">
+      {(() => {
+        const name = item.menuitemname || item.name || item.menuItemName || 'Unknown Item';
+        console.log('Item data:', item); // Debug log
+        console.log('Display name:', name); // Debug log
+        return name;
+      })()}
+    </p>
+    {item.specialinstructions && (
+      <p className="text-sm text-gray-500 italic">Note: {item.specialinstructions}</p>
+    )}
+  </div>
+</td>
+
                     <td className="border border-gray-300 px-4 py-2 text-center">{item.quantity}</td>
                     <td className="border border-gray-300 px-4 py-2 text-right">₹{item.price.toFixed(2)}</td>
                     <td className="border border-gray-300 px-4 py-2 text-right">₹{(item.quantity * item.price).toFixed(2)}</td>
@@ -1386,10 +1418,33 @@ const updatePaymentStatusOptimistic = async (orderId, paymentStatus, paymentMeth
 
 
 
-  const generateBill = (order) => {
+  const generateBill = async (order) => {
+  try {
+    // Try different possible ID fields
+    const orderId = order.id || order._id || order.order_id || order.orderId;
+    
+    console.log('Fetching order:', orderId, 'Full order object:', order);
+    
+    if (!orderId) {
+      console.error('No order ID found!', order);
+      setSelectedOrder(order);
+      setShowInvoice(true);
+      return;
+    }
+    
+    const response = await axios.get(`${API}/orders/${orderId}`);
+    console.log('Received order data:', response.data);
+    setSelectedOrder(response.data);
+    setShowInvoice(true);
+  } catch (error) {
+    console.error('Error fetching order details:', error);
+    // Fallback to using order from list
     setSelectedOrder(order);
     setShowInvoice(true);
-  };
+  }
+};
+
+
 
   return (
     <div className="max-w-7xl mx-auto p-6 space-y-6">
@@ -1643,25 +1698,32 @@ const filteredItems = menuItems.filter(item => {
   const [viewingCustomer, setViewingCustomer] = useState(null);
 
   const addToCart = (menuItem) => {
-    const existingItem = cart.find(item => item.menu_item_id === menuItem.id);
-    if (existingItem) {
-      setCart(cart.map(item => 
-        item.menu_item_id === menuItem.id 
-          ? { ...item, quantity: item.quantity + 1 }
-          : item
-      ));
-    } else {
-      setCart([...cart, {
-        menu_item_id: menuItem.id,
-        menu_item_name: menuItem.name,
-        quantity: 1,
-        price: menuItem.price,
-        special_instructions: '',
-        food_type: menuItem.food_type || 'veg',
-        is_custom_item: false
-      }]);
-    }
-  };
+  console.log("🛒 Adding to cart:", menuItem); // DEBUG
+  
+  const existingItem = cart.find(item => item.menuitemid === menuItem.id);
+  
+  if (existingItem) {
+    setCart(cart.map(item =>
+      item.menuitemid === menuItem.id
+        ? { ...item, quantity: item.quantity + 1 }
+        : item
+    ));
+  } else {
+    setCart([...cart, {
+      menuitemid: String(menuItem.id || menuItem._id || ""),  // ✅ FIX: Handle different ID formats
+      menuitemname: String(menuItem.name || ""),              // ✅ FIX: Ensure string
+      quantity: 1,
+      price: parseFloat(menuItem.price) || 0,
+      specialinstructions: "",
+      foodtype: menuItem.foodtype || "veg",
+      iscustomitem: false
+    }]);
+  }
+  
+  console.log("✅ Cart updated:", cart);  // DEBUG
+};
+
+
 
   const addCustomItemToCart = (customItem) => {
   setCart([...cart, customItem]);
@@ -1736,38 +1798,52 @@ const handleDiscountRemove = () => {
     return;
   }
 
-  try {
+    try {
+    console.log("📦 Cart before sending:", cart); // ✅ DEBUG
+    
     const orderData = {
       order_type: orderType,
-      customer_id: selectedCustomer?.customer_id || null,
-      customer_name: customerName || 'Walk-in',
+      customer_id: selectedCustomer?.customerid || null,
+      customer_name: customerName || "Walk-in",
       phone: phone || null,
       address: address || null,
-      table_number: orderType === 'dine-in' ? tableNumber : null,
-      items: cart,
+      table_number: orderType === "dine-in" ? tableNumber : null,
+      items: cart.map(item => ({
+        menuitemid: String(item.menuitemid || ""),        // ✅ Ensure string
+        menuitemname: String(item.menuitemname || ""),    // ✅ Ensure string
+        price: parseFloat(item.price) || 0,
+        quantity: parseInt(item.quantity) || 1,
+        specialinstructions: item.specialinstructions || "",
+        foodtype: item.foodtype || "veg",
+        iscustomitem: item.iscustomitem || false
+      })),
       discount: discount || null,
       gst_applicable: true
     };
 
+    console.log("🚀 Sending order data:", orderData); // ✅ DEBUG
+    
     await axios.post(`${API_BASE_URL}/api/orders`, orderData);
-
+    
     // Reset form
     setCart([]);
-    setCustomerName('');
-    setTableNumber('');
-    setPhone('');
-    setAddress('');
+    setCustomerName("");
+    setTableNumber("");
+    setPhone("");
+    setAddress("");
     setDiscount(null);
     setSelectedCustomer(null);
-    setOrderType('dine-in');
-
-    alert('Order created successfully!');
+    setOrderType("dine-in");
+    
+    alert("Order created successfully!");
     refreshData();
   } catch (error) {
-    console.error('Error creating order:', error);
-    alert('Error creating order: ' + (error.response?.data?.detail || error.message));
+    console.error("❌ Error creating order:", error);
+    alert("Error creating order: " + (error.response?.data?.detail || error.message));
   }
 };
+
+  
 
 
   return (
@@ -2170,7 +2246,7 @@ const KOTScreen = () => {
                 <div className="space-y-1">
                   {order.items.map((item, idx) => (
                     <div key={idx} className="flex justify-between text-sm">
-                      <span>{item.quantity}x {item.menu_item_name}</span>
+                      <span>{item.quantity}x {item.menuitemname || item.name || ''}</span>
                     </div>
                   ))}
                 </div>
@@ -2185,7 +2261,10 @@ const KOTScreen = () => {
             <CardTitle>Recent KOTs</CardTitle>
           </CardHeader>
           <CardContent>
-            {filteredKots.map(kot => (
+                {filteredKots
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      .map(kot => (
+              
   <div 
     key={kot._id} 
     className="border rounded p-4 mb-4 bg-gray-50 ${highlightKot === kot._id ? 'ring-2 ring-orange-500' : ''}"
@@ -2205,7 +2284,7 @@ const KOTScreen = () => {
     <div className="space-y-1">
       {kot.items.map((item, idx) => (
         <div key={idx} className="flex justify-between items-sm">
-          <span>{item.quantity}x {item.menu_item_name}</span>
+          <span>{item.quantity}x {item.menuitemname || item.name || ''}</span>
         </div>
       ))}
     </div>
@@ -2295,7 +2374,7 @@ const handleFileUpload = async (event) => {
   
   try {
     setIsImporting(true);
-    const response = await axios.post(`${API}/menu/import`, formData, {
+    const response = await axios.post(`${API}/inventory/import-menu-with-ingredients`, formData, {
       headers: { 'Content-Type': 'multipart/form-data' }
     });
     
@@ -3913,7 +3992,7 @@ try {
   };
 
     return (
-    <div className="p-64 px-6 py-6 space-y-6">
+    <div className="max-w-7xl mx-auto p-6 space-y-6">
       <div className="flex items-center justify-between">
         <h1 className="text-3xl font-bold">💳 Payments Dashboard</h1>
         <div className="flex items-center gap-2">
@@ -4598,7 +4677,7 @@ try {
                     <TableRow key={index}>
                       <TableCell>
                         <div>
-                          <p className="font-medium">{item.menu_item_name || item.menuitem_name || item.menuitemname || item.name || "Unknown Item"}</p>
+                          <p className="font-medium">{item.menuitemname || item.name || "Unknown Item"}</p>
                           {item.special_instructions && (
                             <p className="text-xs text-gray-500 italic">
                               Note: {item.special_instructions}
@@ -4836,6 +4915,7 @@ try {
 
 // Main App Component
 function App() {
+  const [showChatbot, setShowChatbot] = useState(false);
   return (
     <RestaurantProvider>
       <div className="min-h-screen bg-gray-50">
@@ -4850,8 +4930,27 @@ function App() {
             <Route path="/menu" element={<MenuManagement />} />
             <Route path="/daily-report" element={<DailyReport />} />
             <Route path="/payments" element={<PaymentsDashboard />} />
+            <Route path="/inventory" element={<InventoryDashboard />} />
+            <Route path="/inventory/items" element={<InventoryList />} />
+            <Route path="/inventory/add" element={<AddInventoryItem />} />
+            <Route path="/inventory/edit/:id" element={<AddInventoryItem />} />
+            <Route path="/inventory/import" element={<ImportInventory />} />
+            <Route path="/inventory/transactions" element={<StockTransactions />} />
+            <Route path="/inventory/alerts" element={<LowStockAlerts />} />
           </Routes>
         </BrowserRouter>
+                {/* Chatbot Components */}
+        {!showChatbot && <ChatbotButton onClick={() => setShowChatbot(true)} />}
+        <ChatbotModal 
+          isOpen={showChatbot}
+          onClose={() => setShowChatbot(false)}
+          tableNumber={null}
+          onOrderComplete={(orderId, order) => {
+            console.log('Order completed:', orderId);
+            setShowChatbot(false);
+            // Refresh data if you have a refresh function
+          }}
+        />
       </div>
     </RestaurantProvider>
   );
