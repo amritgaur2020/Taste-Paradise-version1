@@ -11,10 +11,6 @@ services:
         value: https://taste-paradise-backend.onrender.com
       - key: NODE_ENV
         value: production
-    routes:
-      - path: /
-        destination: /
-
   # Backend Service - FastAPI
   - type: web
     name: taste-paradise-backend
@@ -29,10 +25,3 @@ services:
         sync: false
       - key: PYTHONUNBUFFERED
         value: "true"
-    routes:
-      - path: /api
-        destination: /api
-      - path: /docs
-        destination: /docs
-      - path: /redoc
-        destination: /redoc
