@@ -5,8 +5,7 @@ services:
     env: node
     plan: free
     buildCommand: cd frontend && npm install && npm run build
-    startCommand: cd frontend && npx serve -s build -l 3000
-    envVars:
+    startCommand: cd frontend && npm start
       - key: REACT_APP_API_URL
         value: https://taste-paradise-backend.onrender.com
       - key: NODE_ENV
