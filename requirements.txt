@@ -5,8 +5,7 @@ python-multipart==0.0.18
 
 # ==================== DATABASE ====================
 pymongo===4.5.0
-motor=3.3.0# ==================== AUTHENTICATION & SECURITY ====================
-passlib[bcrypt]==1.7.4
+motor=3.3.0 # ==================== AUTHENTICATION & SECURITY ====================passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
 
 # ==================== ENVIRONMENT & CONFIGURATION ====================
