@@ -26,6 +26,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # Import payment routes
 from routes.payment_routes import router as payment_router, init_payment_routes
 
+# Fix for MongoDB URI environment variable
+if not os.getenv('MONGODB_URI'):
+    if os.getenv('MONGODB_URL'):
+        os.environ['MONGODB_URI'] = os.getenv('MONGODB_URL')
+
 # ==================== CONFIG ====================
 IST = pytz.timezone('Asia/Kolkata')
 
