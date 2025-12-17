@@ -3848,6 +3848,23 @@ if __name__ == "__main__":
         input("\nPress Enter to exit...")
         sys.exit(1)
 
+# ==================== ENTRY POINT FOR UVICORN ====================
+if __name__ == "__main__":
+    import uvicorn
+    import os
+    
+    port = int(os.environ.get("PORT", 8002))
+    host = "0.0.0.0"
+    
+    # Run the FastAPI app with uvicorn
+    uvicorn.run(
+        app,
+        host=host,
+        port=port,
+        log_level="error",
+        access_log=False
+    )
+
 
 
 
