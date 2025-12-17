@@ -8,8 +8,7 @@ services:
     startCommand: cd frontend && npx serve -s build -l 3000
     envVars:
       - key: REACT_APP_API_URL
-        value: https://taste-paradise-backend.onrender.com
-      - key: NODE_ENV
+https://taste-paradise-backend-lxz1.onrender.com      - key: NODE_ENV
         value: production
 
   # Backend Service - FastAPI
