@@ -4,7 +4,7 @@ services:
     name: taste-paradise-frontend
     env: node
     plan: free
-buildcommand:      npm --prefix ./frontend ci && npm --prefix ./frontend run build
+buildcommand:      /bin/sh -c "cd frontend && npm install && npm run build"
     startCommand: cd frontend && npx serve -s build -l 3000
     envVars:
       - key: REACT_APP_API_URL
