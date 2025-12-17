@@ -205,6 +205,7 @@ STATIC_DIR = APP_DIR / "static"
 mongodb_process = None
 mongo_client = None
 db = None
+mongodb_connected = False 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -1400,19 +1401,24 @@ scheduler = AsyncIOScheduler()
 
 @app.on_event("startup")
 async def startup():
-    global mongo_client, db
+    global mongo_client, db, chatbot_db, mongodb_connected
     
-    # Retry connection logic
-    max_retries = 10
+    logger.info("🚀 Starting TasteParadise...")
+    
+    # Try to connect to MongoDB but don't fail if it doesn't work
+    max_retries = 3  # Reduced retries for faster startup
     retry_delay = 2  # seconds
     
     for attempt in range(max_retries):
         try:
+            MONGODB_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
+            logger.info(f"Attempting MongoDB connection (attempt {attempt + 1}/{max_retries})...")
+            
             mongo_client = AsyncIOMotorClient(
-                "mongodb://localhost:27017",
-                serverSelectionTimeoutMS=30000,  # 30 second timeout
-                connectTimeoutMS=30000,
-                socketTimeoutMS=30000,
+                MONGODB_URL,
+                serverSelectionTimeoutMS=5000,  # 5 second timeout
+                connectTimeoutMS=5000,
+                socketTimeoutMS=5000,
                 maxPoolSize=50,
                 minPoolSize=5,
                 retryWrites=True,
@@ -1422,8 +1428,10 @@ async def startup():
             
             # Test the connection
             await mongo_client.admin.command('ping')
-            
             db = mongo_client.taste_paradise
+            chatbot_db = db
+            
+            # Create collections if needed
             try:
                 collections = await db.list_collection_names()
                 if "inventory_items" not in collections:
@@ -1434,34 +1442,76 @@ async def startup():
                     logger.info("✅ Menu items collection created")
             except Exception as e:
                 logger.warning(f"Could not create collections: {e}")
-
-                        # Initialize inventory system
+            
+            # Initialize inventory system
             try:
                 inventory.set_db(db)
                 await inventory.initialize_collections()
                 logger.info("✅ Inventory system initialized")
             except Exception as e:
                 logger.error(f"Inventory initialization failed: {e}")
-        
-
-    
-            # Set database reference (at same level as try)
-            global chatbot_db
-            chatbot_db = db
-            logger.info("✅ Chatbot database reference set")
-            logger.info(f"Connected to database successfully (attempt {attempt + 1})")
-            init_payment_routes(db)
-            logger.info("Payment routes initialized successfully")
-            break  # Exit the retry loop
-
-        except Exception as e:  # This catches the outer MongoDB connection errors
-            if attempt == max_retries - 1:
-                logger.error(f"Failed to connect to MongoDB after {max_retries} attempts: {e}")
-                raise
-            else:
-                logger.warning(f"MongoDB connection attempt {attempt + 1} failed: {e}")
-                await asyncio.sleep(retry_delay)            
             
+            # Initialize payment routes
+            try:
+                logger.info("✅ Chatbot database reference set")
+                init_payment_routes(db)
+                logger.info("✅ Payment routes initialized successfully")
+            except Exception as e:
+                logger.error(f"Payment routes initialization failed: {e}")
+            
+            mongodb_connected = True
+            logger.info(f"✅ Connected to database successfully (attempt {attempt + 1})")
+            break  # Exit the retry loop on success
+            
+        except Exception as e:
+            logger.warning(f"MongoDB connection attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.error(f"⚠️  Failed to connect to MongoDB after {max_retries} attempts")
+                logger.error("⚠️  App will run in READ-ONLY mode (no data persistence)")
+                logger.error(f"⚠️  Error: {e}")
+                mongodb_connected = False
+                # DON'T raise - let the app start anyway
+    
+    # Start scheduler regardless of MongoDB status
+            try:
+                if not scheduler.get_job('daily_reset'):
+                    scheduler.add_job(
+                        daily_reset,
+                        'cron',
+                        hour=0,
+                        minute=0,
+                        second=0,
+                        id='daily_reset',
+                        replace_existing=True
+                    )
+            except Exception as e:
+                logger.error(f"Scheduler error: {e}")
+    
+            if not scheduler.running:
+                scheduler.start()
+                logger.info("✅ Scheduler started - daily reset scheduled for midnight")
+    
+    # Cloud sync (only if MongoDB connected)
+            if mongodb_connected:
+                try:
+                    from cloud_sync_service import init_cloud_sync
+                    from license_cloud_api import license_system
+            
+                    local_license = license_system.load_local_license()
+                    if local_license:
+                        license_key = local_license.get("key")
+                        logger.info(f"Initializing cloud sync for license {license_key[:20]}...")
+                        cloud_sync = init_cloud_sync(license_key)
+                        logger.info("✅ Cloud sync service started successfully")
+                    else:
+                        logger.warning("No license found - cloud sync disabled")
+                except Exception as e:
+                    logger.warning(f"Cloud sync initialization failed: {e}")
+    
+            logger.info("✅ TasteParadise startup complete!")
+
 
 
 
@@ -3327,6 +3377,17 @@ async def login(admin_id: str = Form(...), password: str = Form(...)):
     except Exception as e:
         logger.error(f"Login error: {str(e)}")
         raise HTTPException(status_code=500, details=str(e))
+    
+
+@app.get("/api/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "database": "connected" if mongodb_connected else "disconnected",
+        "mode": "full" if mongodb_connected else "read-only",
+        "message": "TasteParadise is running" if mongodb_connected else "Running without database - data will not be saved"
+    }
+
 
 # Line 1352
 # ==================== INCLUDE API ROUTER ====================
