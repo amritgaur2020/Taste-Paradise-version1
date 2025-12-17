@@ -1,6 +1,6 @@
 # Cloudflare Workers Configuration for Taste Paradise API
 name = "taste-paradise-backend"
-main = "api/index.py"
+main = "main.py"
 compatibility_date = "2025-01-15"
 
 # Enable Python support
