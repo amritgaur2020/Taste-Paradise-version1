@@ -1,0 +1,31 @@
+# Cloudflare Workers Configuration for Taste Paradise API
+name = "taste-paradise-backend"
+main = "api/index.py"
+compatibility_date = "2025-01-15"
+
+# Enable Python support
+workers_dev = true
+
+# Environment variables
+[env.production]
+vars = { ENVIRONMENT = "production" }
+
+[env.development]
+vars = { ENVIRONMENT = "development" }
+
+# Routes configuration
+[[routes]]
+pattern = "api.taste-paradise.workers.dev/*"
+zone_name = "workers.dev"
+
+# Python version
+[build]
+command = "pip install -r requirements.txt"
+cwd = "./"
+
+# Service bindings (if using Durable Objects or other services)
+[services]
+
+# Analytics Engine bindings (optional)
+[analytics]
+enabled = true
